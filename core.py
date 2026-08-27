@@ -3979,6 +3979,11 @@ def evaluate_formula(formula, soldes_n, soldes_n1, rubrique_values=None, defined
         value = eval(py_expr, {"__builtins__": {}}, namespace)
     except RubriqueNotReady:
         raise
+    except ZeroDivisionError:
+        # Ratio mathématiquement indéfini (ex. rentabilité financière quand les capitaux propres
+        # sont nuls) — état normal en tout début d'exercice, pas une formule cassée : on affiche
+        # une cellule vide (« — ») plutôt que de faire remonter une erreur.
+        value = None
     except Exception as e:
         raise FormulaError("Erreur d'évaluation (%s) : %s" % (formula, e))
     return value, rubrique_id
