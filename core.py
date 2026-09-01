@@ -622,6 +622,7 @@ def init_db(conn):
             numero TEXT NOT NULL,
             date_reglement TEXT NOT NULL,
             bon_commande_id INTEGER,
+            facture_achat_id INTEGER,
             fournisseur_code TEXT,
             entete TEXT,
             pied_page TEXT,
@@ -929,6 +930,10 @@ def _migrate(conn):
     cf_cols = [r["name"] for r in conn.execute("PRAGMA table_info(commandes_fournisseurs)")]
     if cf_cols and "facture_achat_id" not in cf_cols:
         conn.execute("ALTER TABLE commandes_fournisseurs ADD COLUMN facture_achat_id INTEGER")
+
+    rg_cols = [r["name"] for r in conn.execute("PRAGMA table_info(reglements)")]
+    if rg_cols and "facture_achat_id" not in rg_cols:
+        conn.execute("ALTER TABLE reglements ADD COLUMN facture_achat_id INTEGER")
 
     # Migre l'ancien mécanisme "stock_initial_<compte>" (settings) vers opening_balances
     default_exercice = str(datetime.today().year)
@@ -5609,11 +5614,15 @@ def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=N
     ligne liée à un compte de marchandises (31) ou de matières premières (32).
 
     `date_paiement_prevu` (JJ/MM/AAAA ou AAAA-MM-JJ) : obligatoire — dès qu'elle est
-    renseignée, la facture est validée (comptabilisée) ET, si elle provient d'un Bon
-    de commande (circuit ENGAGEMENTS-PROJETS > Expression de besoin), un Bordereau de
-    livraison est généré automatiquement (lignes recopiées). L'échéance est aussi
-    répercutée sur l'engagement correspondant dans ENGAGEMENTS-PROJETS > Contrats et
-    devient visible dans le prévisionnel de TRÉSORERIE.
+    renseignée, la facture est validée (comptabilisée) ET :
+    - un Bordereau de livraison est généré automatiquement (lignes recopiées) ;
+    - la facture est placée dans ENGAGEMENTS-PROJETS > Règlements, déjà marquée validée
+      (la charge est déjà comptabilisée ci-dessus, pas de double écriture) — il ne reste
+      plus qu'à y choisir la banque/caisse et enregistrer le paiement pour comptabiliser
+      le règlement (Débit fournisseur 401000 / Crédit banque, voir
+      enregistrer_paiement_reglement) ;
+    - l'échéance est répercutée sur l'engagement correspondant dans ENGAGEMENTS-PROJETS >
+      Contrats et devient visible dans le prévisionnel de TRÉSORERIE.
 
     Retourne la liste des avertissements."""
     facture = get_facture_achat(conn, facture_id)
@@ -5675,16 +5684,34 @@ def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=N
     if commande:
         update_commande(conn, commande["id"], date_echeance_paiement=date_paiement_prevu)
 
-    # Bon de commande interne (Expression de besoin) : génère le bordereau de livraison.
-    if facture.get("bon_commande_id"):
-        bon = get_ep_bon_commande(conn, facture["bon_commande_id"])
-        if bon:
-            bordereau_id = create_bordereau_livraison(
-                conn, bon["numero"], date_str, bon_commande_id=bon["id"],
-                entete=bon["entete"], pied_page=bon["pied_page"])
-            for l in lignes:
-                add_ligne_bordereau_livraison(conn, bordereau_id, l["libelle"], l["quantite"], l["quantite"])
-            update_ep_bon_commande(conn, bon["id"], piece=piece)
+    # Génère le bordereau de livraison — rattaché au Bon de commande d'origine s'il y en
+    # a un (Expression de besoin), sinon directement à la facture, pour toute facture
+    # validée (permet de confirmer la réception même pour une facture saisie directement).
+    bon = get_ep_bon_commande(conn, facture["bon_commande_id"]) if facture.get("bon_commande_id") else None
+    bordereau_id = create_bordereau_livraison(
+        conn, bon["numero"] if bon else facture["numero"], date_str,
+        bon_commande_id=bon["id"] if bon else None,
+        entete=(bon["entete"] if bon else facture["entete"]) or "",
+        pied_page=(bon["pied_page"] if bon else facture["pied_page"]) or "")
+    for l in lignes:
+        add_ligne_bordereau_livraison(conn, bordereau_id, l["libelle"], l["quantite"], l["quantite"])
+    if bon:
+        update_ep_bon_commande(conn, bon["id"], piece=piece)
+
+    # Place la facture dans ENGAGEMENTS-PROJETS > Règlements, prête à être payée : la
+    # charge est DÉJÀ comptabilisée ci-dessus (pas de nouvelle écriture ici, seulement
+    # traçabilité) — il ne reste plus qu'à choisir la banque et enregistrer le paiement
+    # (voir enregistrer_paiement_reglement), qui comptabilisera Débit 401000 / Crédit banque.
+    reglement_id = create_reglement(conn, facture["numero"], date_str,
+                                     bon_commande_id=facture.get("bon_commande_id"),
+                                     fournisseur_code=facture["fournisseur_code"],
+                                     entete=facture["entete"], pied_page=facture["pied_page"],
+                                     retenue_taux=facture["retenue_taux"], retenue_compte=facture["retenue_compte"])
+    for l in lignes:
+        add_ligne_reglement(conn, reglement_id, compte_charge=l["compte_achat"], libelle=l["libelle"],
+                             quantite=l["quantite"], prix_unitaire=l["prix_unitaire"],
+                             analytic_code=l.get("analytic_code"))
+    update_reglement(conn, reglement_id, statut="validee", piece=piece, facture_achat_id=facture_id)
 
     return warnings
 

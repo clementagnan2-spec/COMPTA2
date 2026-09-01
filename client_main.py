@@ -2242,20 +2242,26 @@ class RemoteFournisseursTab(ttk.Frame):
 
 
 class RemoteReglementsTab(ttk.Frame):
-    """Règlements fournisseurs (ENGAGEMENTS-PROJETS) via le réseau — un
-    règlement validé comptabilise directement l'achat (débit du compte de
-    charge choisi par ligne, crédit fournisseur), exactement comme sur
-    l'application de bureau."""
+    """Règlements fournisseurs (ENGAGEMENTS-PROJETS) via le réseau —
+    reçoit automatiquement les factures d'achat validées (déjà
+    comptabilisées, pas de nouvelle écriture ici), permet aussi d'en
+    créer directement. Choisir la banque/caisse et enregistrer le
+    paiement comptabilise Débit fournisseur (401000) / Crédit banque."""
 
     def __init__(self, parent, remote: RemoteConnection):
         super().__init__(parent)
         self.remote = remote
         self.reglement_id_selectionne = None
-        self.lignes = []  # [{"compte_charge":..., "libelle":..., "quantite":..., "prix_unitaire":...}, ...]
+        self.lignes = []
 
         ttk.Label(self, text="RÈGLEMENTS", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 8))
+        ttk.Label(self, text=(
+            "Les factures d'achat validées (menu ENGAGEMENTS-PROJETS > Factures frs) apparaissent ici "
+            "automatiquement, déjà « validée » — la charge est déjà comptabilisée. Sélectionnez-en une, "
+            "choisissez la banque/caisse et cliquez « Enregistrer le paiement »."
+        ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
 
-        header = ttk.LabelFrame(self, text="Nouveau règlement")
+        header = ttk.LabelFrame(self, text="Nouveau règlement (créé directement, hors circuit Factures frs)")
         header.pack(fill="x", padx=16, pady=4)
         ttk.Label(header, text="Numéro :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.numero_var = tk.StringVar()
@@ -2263,16 +2269,21 @@ class RemoteReglementsTab(ttk.Frame):
         ttk.Label(header, text="Date (JJ/MM/AAAA) :").grid(row=0, column=2, sticky="w", padx=(12, 4))
         self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
         ttk.Entry(header, textvariable=self.date_var, width=12).grid(row=0, column=3, padx=4)
-        ttk.Label(header, text="Fournisseur (code) :").grid(row=0, column=4, sticky="w", padx=(12, 4))
+        ttk.Label(header, text="Fournisseur :").grid(row=0, column=4, sticky="w", padx=(12, 4))
         self.fournisseur_var = tk.StringVar()
-        ttk.Entry(header, textvariable=self.fournisseur_var, width=14).grid(row=0, column=5, padx=4)
+        self.fournisseur_combo = ttk.Combobox(header, textvariable=self.fournisseur_var, width=26)
+        self.fournisseur_combo.grid(row=0, column=5, padx=4)
+        self.fournisseur_combo.bind("<KeyRelease>", self._on_fournisseur_keyrelease)
+        self._refresh_fournisseur_values()
         ttk.Button(header, text="Créer le règlement", command=self.creer).grid(row=0, column=6, padx=12)
 
         ligne_frame = ttk.LabelFrame(self, text="Lignes (une fois le règlement créé, sélectionné dans la liste)")
         ligne_frame.pack(fill="x", padx=16, pady=(0, 8))
         ttk.Label(ligne_frame, text="Compte de charge :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.compte_var = tk.StringVar()
-        ttk.Entry(ligne_frame, textvariable=self.compte_var, width=14).grid(row=0, column=1, padx=4)
+        self.compte_combo = ttk.Combobox(ligne_frame, textvariable=self.compte_var, width=26)
+        self.compte_combo.grid(row=0, column=1, padx=4)
+        self.compte_combo.bind("<KeyRelease>", self._on_compte_keyrelease)
         ttk.Label(ligne_frame, text="Libellé :").grid(row=0, column=2, sticky="w", padx=(12, 4))
         self.libelle_var = tk.StringVar()
         ttk.Entry(ligne_frame, textvariable=self.libelle_var, width=26).grid(row=0, column=3, padx=4)
@@ -2285,21 +2296,41 @@ class RemoteReglementsTab(ttk.Frame):
         ttk.Button(ligne_frame, text="Ajouter la ligne", command=self.ajouter_ligne).grid(row=0, column=8, padx=12)
 
         self.tree_lignes = ttk.Treeview(self, columns=("compte", "libelle", "qte", "prix"), show="headings",
-                                         height=6)
+                                         height=5)
         for c, h, w in zip(("compte", "libelle", "qte", "prix"), ["Compte", "Libellé", "Qté", "Prix unit."],
                            [100, 300, 60, 110]):
             self.tree_lignes.heading(c, text=h)
             self.tree_lignes.column(c, width=w, anchor="w")
         self.tree_lignes.pack(fill="x", padx=16, pady=(0, 4))
-        ttk.Button(self, text="Valider le règlement (comptabilise l'achat sur le serveur)",
-                   command=self.valider).pack(anchor="w", padx=16, pady=8)
+        ttk.Button(self, text="Valider le règlement (comptabilise l'achat sur le serveur — règlement "
+                               "créé directement uniquement)", command=self.valider).pack(
+            anchor="w", padx=16, pady=(4, 8))
+
+        paiement_frame = ttk.LabelFrame(self, text="Enregistrer le paiement du règlement sélectionné")
+        paiement_frame.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Label(paiement_frame, text="Date de paiement (JJ/MM/AAAA) :").grid(
+            row=0, column=0, sticky="w", padx=4, pady=4)
+        self.date_paiement_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(paiement_frame, textvariable=self.date_paiement_var, width=12).grid(row=0, column=1, padx=4)
+        ttk.Label(paiement_frame, text="Compte banque/caisse :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.compte_paiement_var = tk.StringVar()
+        self.compte_paiement_combo = ttk.Combobox(paiement_frame, textvariable=self.compte_paiement_var, width=30)
+        self.compte_paiement_combo.grid(row=0, column=3, padx=4)
+        self.compte_paiement_combo.bind("<KeyRelease>", self._on_compte_paiement_keyrelease)
+        self._refresh_compte_paiement_values()
+        ttk.Button(paiement_frame, text="Enregistrer le paiement", command=self.enregistrer_paiement).grid(
+            row=0, column=4, padx=12)
+        self.paiement_statut_var = tk.StringVar()
+        ttk.Label(paiement_frame, textvariable=self.paiement_statut_var, foreground="#1F7A1F").grid(
+            row=1, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 4))
 
         ttk.Separator(self).pack(fill="x", padx=16, pady=4)
         ttk.Label(self, text="Règlements existants", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16)
         ttk.Button(self, text="Actualiser", command=self.refresh).pack(anchor="w", padx=16, pady=(2, 4))
-        cols = ("id", "numero", "date", "fournisseur", "statut")
+        cols = ("id", "numero", "date", "fournisseur", "statut", "paiement")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=10)
-        for c, h, w in zip(cols, ["ID", "Numéro", "Date", "Fournisseur", "Statut"], [40, 100, 90, 260, 100]):
+        headers = ["ID", "Numéro", "Date", "Fournisseur", "Statut", "Paiement"]
+        for c, h, w in zip(cols, headers, [40, 100, 90, 220, 100, 140]):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=16, pady=(0, 16))
@@ -2309,13 +2340,55 @@ class RemoteReglementsTab(ttk.Frame):
     def _appeler(self, fonction, *args, **kwargs):
         return appeler(self, self.remote, fonction, *args, **kwargs)
 
+    @staticmethod
+    def _extract_code(raw):
+        raw = (raw or "").strip()
+        return raw.split(" — ", 1)[0].strip() if " — " in raw else raw
+
+    def _refresh_fournisseur_values(self):
+        items = self._appeler("list_fournisseurs")
+        if items is not APPEL_ECHEC:
+            self.fournisseur_combo["values"] = [f"{f['code']} — {f['raison_sociale']}" for f in items]
+
+    def _on_fournisseur_keyrelease(self, event=None):
+        query = self._extract_code(self.fournisseur_var.get())
+        if query:
+            items = self._appeler("list_fournisseurs", query)
+            if items is not APPEL_ECHEC:
+                self.fournisseur_combo["values"] = [f"{f['code']} — {f['raison_sociale']}" for f in items]
+
+    def _refresh_compte_values(self):
+        items = self._appeler("search_accounts", "6", limit=100)
+        if items is not APPEL_ECHEC:
+            self.compte_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "6"]
+
+    def _on_compte_keyrelease(self, event=None):
+        query = self._extract_code(self.compte_var.get())
+        if query:
+            items = self._appeler("search_accounts", query, limit=50)
+            if items is not APPEL_ECHEC:
+                self.compte_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "6"]
+
+    def _refresh_compte_paiement_values(self):
+        items = self._appeler("search_accounts", "5", limit=100)
+        if items is not APPEL_ECHEC:
+            self.compte_paiement_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "5"]
+
+    def _on_compte_paiement_keyrelease(self, event=None):
+        query = self._extract_code(self.compte_paiement_var.get())
+        if query:
+            items = self._appeler("search_accounts", query, limit=50)
+            if items is not APPEL_ECHEC:
+                self.compte_paiement_combo["values"] = [
+                    f"{a['code']} — {a['label']}" for a in items if a["classe"] == "5"]
+
     def creer(self):
         if not self.numero_var.get().strip():
             messagebox.showwarning("Champ manquant", "Le numéro est obligatoire.", parent=self)
             return
         date_str = core.to_iso_date(self.date_var.get().strip())
         rid = self._appeler("create_reglement", self.numero_var.get(), date_str,
-                             fournisseur_code=self.fournisseur_var.get().strip())
+                             fournisseur_code=self._extract_code(self.fournisseur_var.get()))
         if rid is APPEL_ECHEC:
             return
         self.reglement_id_selectionne = rid
@@ -2328,7 +2401,7 @@ class RemoteReglementsTab(ttk.Frame):
         if not self.reglement_id_selectionne:
             messagebox.showinfo("Info", "Créez ou sélectionnez d'abord un règlement dans la liste.", parent=self)
             return
-        compte = self.compte_var.get().strip()
+        compte = self._extract_code(self.compte_var.get())
         libelle = self.libelle_var.get().strip()
         if not compte or not libelle:
             messagebox.showwarning("Champ manquant", "Compte de charge et libellé sont obligatoires.", parent=self)
@@ -2360,6 +2433,25 @@ class RemoteReglementsTab(ttk.Frame):
         messagebox.showinfo("Validé", "Règlement comptabilisé sur le serveur.", parent=self)
         self.refresh()
 
+    def enregistrer_paiement(self):
+        if not self.reglement_id_selectionne:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un règlement dans la liste.", parent=self)
+            return
+        date_paiement = core.to_iso_date(self.date_paiement_var.get().strip())
+        if not date_paiement:
+            messagebox.showwarning("Champ manquant", "Saisissez la date de paiement.", parent=self)
+            return
+        compte = self._extract_code(self.compte_paiement_var.get())
+        if not compte:
+            messagebox.showwarning("Champ manquant", "Choisissez le compte banque ou caisse.", parent=self)
+            return
+        montant = self._appeler("enregistrer_paiement_reglement", self.reglement_id_selectionne,
+                                 date_paiement, compte)
+        if montant is APPEL_ECHEC:
+            return
+        self.paiement_statut_var.set(f"✓ Paiement de {fmt_cfa(montant)} F CFA comptabilisé sur le serveur.")
+        self.refresh()
+
     def _on_select_reglement(self, event=None):
         sel = self.tree.selection()
         if not sel:
@@ -2367,6 +2459,7 @@ class RemoteReglementsTab(ttk.Frame):
         v = self.tree.item(sel[0], "values")
         self.reglement_id_selectionne = int(v[0])
         self._refresh_lignes()
+        self.paiement_statut_var.set("")
 
     def _refresh_lignes(self):
         for row in self.tree_lignes.get_children():
@@ -2382,14 +2475,18 @@ class RemoteReglementsTab(ttk.Frame):
                 fmt_cfa(l["prix_unitaire"])))
 
     def refresh(self):
+        self._refresh_compte_values()
         reglements = self._appeler("list_reglements")
         if reglements is APPEL_ECHEC:
             return
         for row in self.tree.get_children():
             self.tree.delete(row)
         for r in reglements:
+            paiement = "✓ Payé" if r.get("paiement_comptabilise") else (
+                "En attente" if r["statut"] == "validee" else "—")
             self.tree.insert("", "end", values=(
-                r["id"], r["numero"], core.to_display_date(r["date_reglement"]), r["raison_sociale"], r["statut"]))
+                r["id"], r["numero"], core.to_display_date(r["date_reglement"]), r["raison_sociale"],
+                r["statut"], paiement))
 
 
 class RemoteEtatFormuleTab(ttk.Frame):
