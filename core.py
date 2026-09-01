@@ -453,7 +453,8 @@ def init_db(conn):
             date_livraison_prevue TEXT,
             date_livraison_reelle TEXT,
             date_echeance_paiement TEXT,
-            date_paiement_reel TEXT
+            date_paiement_reel TEXT,
+            facture_achat_id INTEGER
         )
     """)
     conn.execute("""
@@ -538,7 +539,9 @@ def init_db(conn):
             retenue_taux REAL NOT NULL DEFAULT 0,
             retenue_compte TEXT NOT NULL DEFAULT '447800',
             statut TEXT NOT NULL DEFAULT 'brouillon',
-            piece TEXT
+            piece TEXT,
+            bon_commande_id INTEGER,
+            date_paiement_prevu TEXT
         )
     """)
     conn.execute("""
@@ -916,6 +919,16 @@ def _migrate(conn):
         conn.execute("ALTER TABLE immobilisations_fiche ADD COLUMN base_repartition_unite TEXT")
     if if_cols and "amortissement_annuel_manuel" not in if_cols:
         conn.execute("ALTER TABLE immobilisations_fiche ADD COLUMN amortissement_annuel_manuel REAL")
+
+    fa_cols = [r["name"] for r in conn.execute("PRAGMA table_info(factures_achat)")]
+    if fa_cols and "bon_commande_id" not in fa_cols:
+        conn.execute("ALTER TABLE factures_achat ADD COLUMN bon_commande_id INTEGER")
+    if fa_cols and "date_paiement_prevu" not in fa_cols:
+        conn.execute("ALTER TABLE factures_achat ADD COLUMN date_paiement_prevu TEXT")
+
+    cf_cols = [r["name"] for r in conn.execute("PRAGMA table_info(commandes_fournisseurs)")]
+    if cf_cols and "facture_achat_id" not in cf_cols:
+        conn.execute("ALTER TABLE commandes_fournisseurs ADD COLUMN facture_achat_id INTEGER")
 
     # Migre l'ancien mécanisme "stock_initial_<compte>" (settings) vers opening_balances
     default_exercice = str(datetime.today().year)
@@ -5590,10 +5603,18 @@ def compute_facture_achat_totals(conn, facture_id):
             "net_a_payer": net_a_payer}
 
 
-def valider_facture_achat(conn, facture_id, exercice=None):
+def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=None):
     """Envoie la facture d'achat en Saisie : une écriture équilibrée (Débit achats /
     Crédit fournisseur + retenue), plus une entrée de stock automatique pour chaque
     ligne liée à un compte de marchandises (31) ou de matières premières (32).
+
+    `date_paiement_prevu` (JJ/MM/AAAA ou AAAA-MM-JJ) : obligatoire — dès qu'elle est
+    renseignée, la facture est validée (comptabilisée) ET, si elle provient d'un Bon
+    de commande (circuit ENGAGEMENTS-PROJETS > Expression de besoin), un Bordereau de
+    livraison est généré automatiquement (lignes recopiées). L'échéance est aussi
+    répercutée sur l'engagement correspondant dans ENGAGEMENTS-PROJETS > Contrats et
+    devient visible dans le prévisionnel de TRÉSORERIE.
+
     Retourne la liste des avertissements."""
     facture = get_facture_achat(conn, facture_id)
     if not facture:
@@ -5605,6 +5626,9 @@ def valider_facture_achat(conn, facture_id, exercice=None):
         raise ValueError("La facture ne contient aucune ligne.")
     if not fournisseur_exists(conn, facture["fournisseur_code"]):
         raise ValueError(f"Le fournisseur « {facture['fournisseur_code']} » n'existe pas.")
+    date_paiement_prevu = to_iso_date(date_paiement_prevu) if date_paiement_prevu else facture.get("date_paiement_prevu")
+    if not date_paiement_prevu:
+        raise ValueError("La date de règlement prévue est obligatoire pour valider une facture d'achat.")
 
     totals = compute_facture_achat_totals(conn, facture_id)
     date_str = facture["date_facture"]
@@ -5641,7 +5665,27 @@ def valider_facture_achat(conn, facture_id, exercice=None):
         add_entry(conn, date_str, piece, "AC", contre_compte, "", f"Entrée stock — {l['libelle']}",
                   0, montant_entree)
 
-    update_facture_achat(conn, facture_id, statut="validee", piece=piece)
+    update_facture_achat(conn, facture_id, statut="validee", piece=piece,
+                          date_paiement_prevu=date_paiement_prevu)
+
+    # Répercute l'échéance sur l'engagement lié (visible dans Contrats/Trésorerie).
+    commande = conn.execute(
+        "SELECT * FROM commandes_fournisseurs WHERE facture_achat_id = ?", (facture_id,)
+    ).fetchone()
+    if commande:
+        update_commande(conn, commande["id"], date_echeance_paiement=date_paiement_prevu)
+
+    # Bon de commande interne (Expression de besoin) : génère le bordereau de livraison.
+    if facture.get("bon_commande_id"):
+        bon = get_ep_bon_commande(conn, facture["bon_commande_id"])
+        if bon:
+            bordereau_id = create_bordereau_livraison(
+                conn, bon["numero"], date_str, bon_commande_id=bon["id"],
+                entete=bon["entete"], pied_page=bon["pied_page"])
+            for l in lignes:
+                add_ligne_bordereau_livraison(conn, bordereau_id, l["libelle"], l["quantite"], l["quantite"])
+            update_ep_bon_commande(conn, bon["id"], piece=piece)
+
     return warnings
 
 
@@ -7194,17 +7238,14 @@ def compute_ep_bon_commande_totals(conn, bon_id):
 
 
 def valider_ep_bon_commande(conn, bon_id):
-    """Valide le Bon de commande : COMPTABILISE DIRECTEMENT l'achat (Débit
-    comptes de charge choisis par ligne avec code analytique, Crédit
-    fournisseur, retenue fiscale optionnelle, entrée de stock automatique
-    pour les lignes liées à un compte de marchandises/matières premières —
-    voir _comptabiliser_lignes_achat(), même moteur que les Règlements) ET
-    fait basculer le bon en Bordereau de livraison (lignes recopiées,
-    quantité livrée initialisée à la quantité commandée). Un Règlement est
-    également créé pour traçabilité, déjà marqué validé (mêmes écritures,
-    pas de double comptabilisation). Chaque ligne DOIT avoir un compte de
-    charge choisi et un fournisseur doit être renseigné, sous peine de
-    refus explicite. Retourne (bordereau_id, reglement_id)."""
+    """Valide le Bon de commande : fait basculer le bon en FACTURE D'ACHAT
+    (brouillon, lignes recopiées avec leur compte de charge/code
+    analytique) — AUCUNE écriture comptable à ce stade. C'est la
+    validation de cette facture (voir valider_facture_achat, avec sa date
+    de règlement prévu) qui comptabilise l'achat et génère le bordereau de
+    livraison. Chaque ligne DOIT avoir un compte de charge choisi et un
+    fournisseur doit être renseigné, sous peine de refus explicite.
+    Retourne l'ID de la facture d'achat créée."""
     bon = get_ep_bon_commande(conn, bon_id)
     if not bon:
         raise ValueError("Bon de commande introuvable.")
@@ -7213,34 +7254,36 @@ def valider_ep_bon_commande(conn, bon_id):
     lignes = list_lignes_ep_bon_commande(conn, bon_id)
     if not lignes:
         raise ValueError("Ajoutez au moins une ligne avant de valider.")
-
-    fournisseur = get_fournisseur(conn, bon["fournisseur_code"]) if bon["fournisseur_code"] else None
-    tiers_label = fournisseur["raison_sociale"] if fournisseur else (bon["fournisseur_code"] or "")
-    piece = bon["piece"] or bon["numero"]
-
-    _comptabiliser_lignes_achat(conn, bon["date_commande"], piece, "AC", bon["fournisseur_code"], lignes,
-                                 tiers_label, retenue_taux=bon["retenue_taux"], retenue_compte=bon["retenue_compte"])
-
-    bordereau_id = create_bordereau_livraison(conn, bon["numero"], bon["date_commande"], bon_commande_id=bon_id,
-                                               entete=bon["entete"], pied_page=bon["pied_page"])
+    if not bon["fournisseur_code"] or not fournisseur_exists(conn, bon["fournisseur_code"]):
+        raise ValueError("Choisissez un fournisseur existant avant de valider ce bon de commande.")
     for l in lignes:
-        add_ligne_bordereau_livraison(conn, bordereau_id, l["libelle"], l["quantite"], l["quantite"], unite=l["unite"])
+        if not l["compte_charge"] or not account_exists(conn, l["compte_charge"]):
+            raise ValueError(
+                f"La ligne « {l['libelle']} » n'a pas de compte de charge valide — "
+                f"complétez-la avant de valider."
+            )
 
-    reglement_id = create_reglement(conn, bon["numero"], bon["date_commande"], bon_commande_id=bon_id,
-                                     fournisseur_code=bon["fournisseur_code"] or "",
-                                     entete=bon["entete"], pied_page=bon["pied_page"],
-                                     retenue_taux=bon["retenue_taux"], retenue_compte=bon["retenue_compte"])
+    facture_id = create_facture_achat(conn, bon["numero"], bon["date_commande"], bon["fournisseur_code"],
+                                       entete=bon["entete"], pied_page=bon["pied_page"],
+                                       retenue_taux=bon["retenue_taux"], retenue_compte=bon["retenue_compte"])
+    update_facture_achat(conn, facture_id, bon_commande_id=bon_id)
     for l in lignes:
-        add_ligne_reglement(conn, reglement_id, compte_charge=l["compte_charge"], libelle=l["libelle"],
-                             quantite=l["quantite"], prix_unitaire=l["prix_unitaire"],
-                             analytic_code=l.get("analytic_code"))
-    # Le Règlement sert ici à la traçabilité (même pièce comptable déjà
-    # postée par ce Bon de commande) — marqué validé directement pour ne
-    # pas générer une seconde écriture s'il était validé séparément.
-    update_reglement(conn, reglement_id, statut="validee", piece=piece)
+        add_ligne_facture_achat(conn, facture_id, l["compte_charge"], l["libelle"], l["quantite"],
+                                 l["prix_unitaire"], analytic_code=l.get("analytic_code"))
 
-    update_ep_bon_commande(conn, bon_id, statut="validee", piece=piece)
-    return bordereau_id, reglement_id
+    # Visible tout de suite dans ENGAGEMENTS-PROJETS > Contrats, avant même la validation
+    # de la facture — l'échéance de paiement sera précisée dès qu'elle sera connue.
+    commande_id = add_commande(conn, bon["fournisseur_code"], bon["numero"],
+                                bon["entete"] or f"Bon de commande {bon['numero']}",
+                                compute_facture_achat_totals(conn, facture_id)["net_a_payer"],
+                                bon["date_commande"])
+    conn.execute("UPDATE commandes_fournisseurs SET facture_achat_id = ? WHERE id = "
+                 "(SELECT id FROM commandes_fournisseurs WHERE piece = ? ORDER BY id DESC LIMIT 1)",
+                 (facture_id, bon["numero"]))
+
+    update_ep_bon_commande(conn, bon_id, statut="validee")
+    conn.commit()
+    return facture_id
 
 
 # ---- Bordereau de livraison ----
@@ -8364,6 +8407,7 @@ MENU_STRUCTURE = [
     ("ENGAGEMENTS-PROJETS", [("Fournisseurs", "fournisseurs"), ("Contrats", "contrats"),
                               ("Expression de besoin", "expression_besoin"),
                               ("Bon de commande", "ep_bon_commande"),
+                              ("Factures frs", "factures_frs"),
                               ("Bordereau de livraison", "bordereau_livraison"),
                               ("Règlements", "reglements")]),
     ("GRH", [("Liste du personnel", "grh_personnel"), ("Time sheet", "grh_time_sheet"), ("KPI", "grh_kpi"),
@@ -8422,7 +8466,7 @@ def ajouter_niveaux_acces_suggeres_menus(conn):
                         "plan_budgetaire", "plan_bailleur", "synchronisation"]
     vendeur_menus = ["clients", "recouvrement", "facturation", "stocks", "marges"]
     charge_achats_menus = ["fournisseurs", "contrats", "expression_besoin", "ep_bon_commande",
-                            "bordereau_livraison", "reglements"]
+                            "factures_frs", "bordereau_livraison", "reglements"]
     grh_menus = ["grh_personnel", "grh_time_sheet", "grh_kpi", "grh_tableau_bord", "grh_hs", "grh_paie"]
     tresorier_menus = ["tresorerie", "recouvrement", "reglements"]
     usine_menus = ["stocks", "production", "transport", "missions", "pieces_rechange", "reparations",
@@ -9489,6 +9533,50 @@ def compute_tableau_bord_grh(conn):
 # mais dont le paiement bancaire n'a pas encore été comptabilisé — voir
 # enregistrer_paiement_reglement()) pour évaluer la capacité à y faire face.
 # ---------------------------------------------------------------------------
+def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
+    """Prévisionnel de trésorerie basé sur les échéances de paiement
+    connues — fournisseurs (commandes_fournisseurs, sorties futures) et
+    clients (factures_clients, entrées futures) dont le paiement n'a pas
+    encore été enregistré. Permet de voir l'impact des règlements à venir
+    sur la trésorerie, indépendamment du solde bancaire actuel. Trié par
+    date d'échéance croissante, avec solde cumulé (entrées - sorties)."""
+    date_from = date_from or date.today().strftime("%Y-%m-%d")
+    lignes = []
+    for c in list_commandes(conn):
+        if c["date_paiement_reel"] or not c["date_echeance_paiement"]:
+            continue
+        if c["date_echeance_paiement"] < date_from:
+            continue
+        if date_to and c["date_echeance_paiement"] > date_to:
+            continue
+        lignes.append({
+            "date_echeance": c["date_echeance_paiement"], "type": "Fournisseur",
+            "tiers": c["raison_sociale"], "piece": c["piece"] or "", "montant": -c["montant"],
+            "en_retard": c["depassement_paiement"],
+        })
+    for f in list_factures(conn):
+        if f["date_paiement_reel"] or not f["date_echeance_paiement"]:
+            continue
+        if f["date_echeance_paiement"] < date_from:
+            continue
+        if date_to and f["date_echeance_paiement"] > date_to:
+            continue
+        lignes.append({
+            "date_echeance": f["date_echeance_paiement"], "type": "Client",
+            "tiers": f["raison_sociale"], "piece": f["piece"] or "", "montant": f["montant"],
+            "en_retard": f["depassement"],
+        })
+    lignes.sort(key=lambda l: l["date_echeance"])
+    solde_cumule = 0.0
+    for l in lignes:
+        solde_cumule += l["montant"]
+        l["solde_cumule"] = solde_cumule
+    total_entrees = sum(l["montant"] for l in lignes if l["montant"] > 0)
+    total_sorties = sum(-l["montant"] for l in lignes if l["montant"] < 0)
+    return {"lignes": lignes, "total_entrees": total_entrees, "total_sorties": total_sorties,
+            "impact_net": total_entrees - total_sorties}
+
+
 def compute_tresorerie_banques_horizontal(conn, date_from=None, date_to=None, exercice=None):
     """Une ligne par compte de trésorerie (classe 5), avec Solde début /
     Entrées / Sorties / Solde fin de la période choisie (exercice entier

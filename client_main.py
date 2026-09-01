@@ -202,6 +202,7 @@ class ClientApp(tk.Tk):
         "immobilisations": lambda parent, remote: RemoteImmobilisationsTab(parent, remote),
         "expression_besoin": lambda parent, remote: RemoteExpressionBesoinTab(parent, remote),
         "ep_bon_commande": lambda parent, remote: RemoteBonCommandeTab(parent, remote),
+        "factures_frs": lambda parent, remote: RemoteFacturesFrsTab(parent, remote),
         "recouvrement": lambda parent, remote: RemoteRecouvrementTab(parent, remote),
         "marges": lambda parent, remote: RemoteMargesTab(parent, remote),
         "contrats": lambda parent, remote: RemoteContratsTab(parent, remote),
@@ -3213,7 +3214,27 @@ class RemoteTresorerieTab(ttk.Frame):
                            [130, 100, 260, 160]):
             self.tree_engagements.heading(c, text=h)
             self.tree_engagements.column(c, width=w, anchor="w" if c != "montant" else "e")
-        self.tree_engagements.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.tree_engagements.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        ttk.Label(self, text="Échéances (prévisionnel) — factures fournisseurs et clients à venir",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(8, 2))
+        ech_top = ttk.Frame(self)
+        ech_top.pack(fill="x", padx=16)
+        ttk.Label(ech_top, text="À partir du (JJ/MM/AAAA) :").pack(side="left")
+        self.echeance_date_from_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(ech_top, textvariable=self.echeance_date_from_var, width=12).pack(side="left", padx=4)
+        ttk.Button(ech_top, text="Actualiser les échéances", command=self.refresh).pack(side="left", padx=8)
+        self.echeances_synthese_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.echeances_synthese_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=16, pady=(4, 4))
+        cols3 = ("date", "type", "tiers", "piece", "montant", "cumule")
+        self.tree_echeances = ttk.Treeview(self, columns=cols3, show="headings", height=10)
+        for c, h, w in zip(cols3, ["Échéance", "Type", "Tiers", "Pièce", "Montant", "Solde cumulé"],
+                           [90, 90, 220, 100, 130, 140]):
+            self.tree_echeances.heading(c, text=h)
+            self.tree_echeances.column(c, width=w, anchor="w" if c in ("type", "tiers", "piece") else "e")
+        self.tree_echeances.tag_configure("retard", foreground="#B00020")
+        self.tree_echeances.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         self.refresh()
 
     def _appeler(self, fonction, *args, **kwargs):
@@ -3246,6 +3267,21 @@ class RemoteTresorerieTab(ttk.Frame):
         etat = "✓ peut faire face" if d["peut_faire_face"] else "⚠ insuffisant"
         self.synthese_var.set(f"Trésorerie disponible : {fmt_cfa(d['treso_disponible'])}   —   Engagements : "
                                f"{fmt_cfa(d['total_engagements'])}   —   {etat}")
+
+        date_from = core.to_iso_date(self.echeance_date_from_var.get().strip())
+        e = self._appeler("compute_echeances_tresorerie", date_from=date_from)
+        if e is APPEL_ECHEC:
+            return
+        for row in self.tree_echeances.get_children():
+            self.tree_echeances.delete(row)
+        for l in e["lignes"]:
+            tag = ("retard",) if l["en_retard"] else ()
+            self.tree_echeances.insert("", "end", tags=tag, values=(
+                core.to_display_date(l["date_echeance"]), l["type"], l["tiers"], l["piece"],
+                fmt_cfa(l["montant"]), fmt_cfa(l["solde_cumule"])))
+        self.echeances_synthese_var.set(
+            f"Total entrées prévues : {fmt_cfa(e['total_entrees'])}   Total sorties prévues : "
+            f"{fmt_cfa(e['total_sorties'])}   Impact net sur la trésorerie : {fmt_cfa(e['impact_net'])}")
 
 
 class RemoteImmobilisationsTab(ttk.Frame):
@@ -3664,14 +3700,22 @@ class RemoteBonCommandeTab(ttk.Frame):
         if not self.bon_id_selectionne:
             messagebox.showinfo("Info", "Sélectionnez d'abord un bon dans la liste.", parent=self)
             return
-        if not messagebox.askyesno("Valider ce bon de commande",
-                                    "Le bon va être comptabilisé sur le serveur ET un Bordereau de livraison "
-                                    "sera créé. Continuer ?", parent=self):
+        if not messagebox.askyesno(
+                "Valider ce bon de commande",
+                "Le bon va générer une FACTURE D'ACHAT (brouillon, non comptabilisée) avec les lignes "
+                "recopiées. Aucune écriture comptable n'est envoyée à ce stade — c'est la validation de "
+                "cette facture, avec sa date de règlement prévu (menu ENGAGEMENTS-PROJETS > Factures "
+                "frs), qui comptabilisera l'achat et créera le Bordereau de livraison. Continuer ?",
+                parent=self):
             return
         r = self._appeler("valider_ep_bon_commande", self.bon_id_selectionne)
         if r is APPEL_ECHEC:
             return
-        messagebox.showinfo("Validé", "Bon de commande comptabilisé sur le serveur.", parent=self)
+        messagebox.showinfo(
+            "Validé",
+            "Bon de commande validé — une facture d'achat brouillon a été créée dans ENGAGEMENTS-PROJETS "
+            "> Factures frs. Complétez-la si besoin puis validez-la avec sa date de règlement prévu.",
+            parent=self)
         self.refresh()
 
     def _on_select(self, event=None):
@@ -4238,6 +4282,409 @@ class RemoteContratsTab(ttk.Frame):
                 core.to_display_date(c["date_livraison_prevue"]), c["statut_livraison"],
                 core.to_display_date(c["date_echeance_paiement"]), c["statut_paiement"],
             ))
+
+
+class RemoteFacturesFrsTab(ttk.Frame):
+    """Factures fournisseurs (achats) via le réseau — équivalent réseau
+    complet de FacturesFrsTab (bureau) : reçoit les factures générées
+    automatiquement par la validation d'un Bon de commande (ENGAGEMENTS-
+    PROJETS > Expression de besoin), permet d'en créer directement, et
+    sa validation (avec la date de règlement prévu, obligatoire) envoie
+    les écritures comptables sur le serveur — avec entrée de stock
+    automatique pour les lignes marchandises/matières premières."""
+
+    def __init__(self, parent, remote: RemoteConnection):
+        super().__init__(parent)
+        self.remote = remote
+        self.current_facture_id = None
+        self._factures_cache = []
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=12, pady=8)
+        ttk.Label(top, text="Facture n° :").pack(side="left")
+        self.facture_combo = ttk.Combobox(top, width=40, state="readonly")
+        self.facture_combo.pack(side="left", padx=4)
+        self.facture_combo.bind("<<ComboboxSelected>>", self._on_facture_selected)
+        ttk.Button(top, text="Nouvelle facture", command=self.new_facture).pack(side="left", padx=8)
+        ttk.Button(top, text="Supprimer cette facture", command=self.delete_facture).pack(side="left", padx=2)
+        self.corriger_btn = ttk.Button(top, text="Corriger cette facture (erreur sur les chiffres)",
+                                        command=self.corriger_facture)
+        self.corriger_btn.pack(side="left", padx=2)
+        self.statut_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.statut_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=16)
+
+        ttk.Label(self, text="En-tête de la facture (modifiable) :").pack(anchor="w", padx=12)
+        self.entete_text = tk.Text(self, height=3, font=("Segoe UI", 10))
+        self.entete_text.pack(fill="x", padx=12, pady=(0, 8))
+
+        info = ttk.Frame(self)
+        info.pack(fill="x", padx=12, pady=4)
+        ttk.Label(info, text="N° Facture :").grid(row=0, column=0, sticky="w", padx=4)
+        self.numero_var = tk.StringVar()
+        ttk.Entry(info, textvariable=self.numero_var, width=16).grid(row=0, column=1, padx=4)
+        ttk.Label(info, text="Date (JJ/MM/AAAA) :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(info, textvariable=self.date_var, width=14).grid(row=0, column=3, padx=4)
+        ttk.Label(info, text="Fournisseur (compte 40) :").grid(row=0, column=4, sticky="w", padx=(12, 4))
+        self.fournisseur_var = tk.StringVar()
+        self.fournisseur_combo = ttk.Combobox(info, textvariable=self.fournisseur_var, width=26)
+        self.fournisseur_combo.grid(row=0, column=5, padx=4)
+        self.fournisseur_combo.bind("<KeyRelease>", self._on_fournisseur_keyrelease)
+        self._refresh_fournisseur_values()
+
+        ttk.Label(info, text="Retenue % :").grid(row=1, column=0, sticky="w", padx=4, pady=(6, 0))
+        self.retenue_taux_var = tk.StringVar()
+        ttk.Entry(info, textvariable=self.retenue_taux_var, width=6).grid(
+            row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(info, text="Compte retenue (classe 44) :").grid(
+            row=1, column=2, sticky="w", padx=(12, 4), pady=(6, 0))
+        self.retenue_compte_var = tk.StringVar()
+        self.retenue_compte_combo = ttk.Combobox(info, textvariable=self.retenue_compte_var, width=30)
+        self.retenue_compte_combo.grid(row=1, column=3, columnspan=2, sticky="w", padx=4, pady=(6, 0))
+        self.retenue_compte_combo.bind("<KeyRelease>", self._on_retenue_compte_keyrelease)
+        self._refresh_retenue_compte_values()
+        self._init_retenue_defaults()
+
+        ttk.Label(info, text="Date de règlement prévu (JJ/MM/AAAA) :").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
+        self.date_paiement_prevu_var = tk.StringVar()
+        ttk.Entry(info, textvariable=self.date_paiement_prevu_var, width=14).grid(
+            row=2, column=2, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(info, text=(
+            "Obligatoire pour valider — dès qu'elle est renseignée, la facture est comptabilisée sur le "
+            "serveur et devient visible dans ENGAGEMENTS-PROJETS > Contrats et dans TRÉSORERIE."
+        ), foreground="#595959", wraplength=650).grid(row=2, column=3, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+
+        form = ttk.LabelFrame(self, text="Ajouter une ligne (produit/service acheté — compte 6x)")
+        form.pack(fill="x", padx=12, pady=6)
+        ttk.Label(form, text="Compte d'achat :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.ligne_compte_var = tk.StringVar()
+        self.ligne_compte_combo = ttk.Combobox(form, textvariable=self.ligne_compte_var, width=34)
+        self.ligne_compte_combo.grid(row=0, column=1, padx=4)
+        self.ligne_compte_combo.bind("<KeyRelease>", self._on_ligne_compte_keyrelease)
+        self._refresh_ligne_compte_values()
+        ttk.Label(form, text="Libellé :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.ligne_libelle_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.ligne_libelle_var, width=26).grid(row=0, column=3, padx=4)
+        ttk.Label(form, text="Quantité :").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self.ligne_qte_var = tk.StringVar(value="1")
+        ttk.Entry(form, textvariable=self.ligne_qte_var, width=10).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(form, text="Prix unitaire :").grid(row=1, column=2, sticky="w", padx=(12, 4))
+        self.ligne_prix_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.ligne_prix_var, width=14).grid(row=1, column=3, sticky="w", padx=4)
+        ttk.Label(form, text="Code analytique :").grid(row=1, column=4, sticky="w", padx=(12, 4))
+        self.ligne_analytic_var = tk.StringVar()
+        self.ligne_analytic_combo = ttk.Combobox(form, textvariable=self.ligne_analytic_var, width=20)
+        self.ligne_analytic_combo.grid(row=1, column=5, padx=4, sticky="w")
+        self._refresh_ligne_analytic_values()
+        ttk.Button(form, text="Ajouter la ligne", command=self.add_ligne).grid(row=1, column=6, padx=12)
+
+        cols = ("id", "compte", "libelle", "type_stock", "qte", "prix", "analytique", "montant")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=6)
+        headers = ["ID", "Compte", "Libellé", "Impact stock", "Qté", "Prix unit.", "Code analytique", "Montant HT"]
+        widths = [40, 90, 220, 110, 60, 100, 110, 110]
+        for c, h, w in zip(cols, headers, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.pack(fill="x", padx=12, pady=6)
+        ttk.Button(self, text="Supprimer la ligne sélectionnée", command=self.delete_ligne).pack(
+            anchor="w", padx=12)
+
+        self.totals_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.totals_var, font=("Segoe UI", 11, "bold")).pack(
+            anchor="w", padx=12, pady=(8, 0))
+
+        ttk.Label(self, text="Pied de page de la facture (modifiable) :").pack(anchor="w", padx=12, pady=(8, 0))
+        self.pied_text = tk.Text(self, height=3, font=("Segoe UI", 10))
+        self.pied_text.pack(fill="x", padx=12, pady=(0, 8))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=8)
+        ttk.Button(btns, text="Enregistrer la facture", command=self.save_facture).pack(side="left", padx=2)
+        ttk.Button(btns, text="Aperçu avant impression", command=self.imprimer_facture).pack(side="left", padx=2)
+        ttk.Button(btns, text="Valider et envoyer en Saisie", command=self.valider).pack(side="left", padx=2)
+
+        self.refresh_factures_list()
+
+    def _appeler(self, fonction, *args, **kwargs):
+        return appeler(self, self.remote, fonction, *args, **kwargs)
+
+    @staticmethod
+    def _extract_code(raw):
+        raw = (raw or "").strip()
+        return raw.split(" — ", 1)[0].strip() if " — " in raw else raw
+
+    def _refresh_fournisseur_values(self):
+        items = self._appeler("list_fournisseurs")
+        if items is not APPEL_ECHEC:
+            self.fournisseur_combo["values"] = [f"{f['code']} — {f['raison_sociale']}" for f in items]
+
+    def _on_fournisseur_keyrelease(self, event=None):
+        query = self._extract_code(self.fournisseur_var.get())
+        if query:
+            items = self._appeler("list_fournisseurs", query)
+            if items is not APPEL_ECHEC:
+                self.fournisseur_combo["values"] = [f"{f['code']} — {f['raison_sociale']}" for f in items]
+
+    def _refresh_retenue_compte_values(self):
+        items = self._appeler("search_accounts", "44", limit=100)
+        if items is not APPEL_ECHEC:
+            self.retenue_compte_combo["values"] = [
+                f"{a['code']} — {a['label']}" for a in items if a["code"][:2] == "44"]
+
+    def _on_retenue_compte_keyrelease(self, event=None):
+        query = self._extract_code(self.retenue_compte_var.get())
+        if query:
+            items = self._appeler("search_accounts", query, limit=50)
+            if items is not APPEL_ECHEC:
+                self.retenue_compte_combo["values"] = [
+                    f"{a['code']} — {a['label']}" for a in items if a["code"][:2] == "44"]
+
+    def _init_retenue_defaults(self):
+        taux = self._appeler("get_setting", "retenue_taux_defaut", core.RETENUE_TAUX_DEFAUT)
+        if taux is not APPEL_ECHEC:
+            self.retenue_taux_var.set(str(taux))
+        compte = self._appeler("get_text_setting", "retenue_compte_defaut", core.COMPTE_RETENUE_DEFAUT)
+        if compte is not APPEL_ECHEC:
+            self.retenue_compte_var.set(compte)
+
+    def _refresh_ligne_compte_values(self):
+        items = self._appeler("search_accounts", "6", limit=100)
+        if items is not APPEL_ECHEC:
+            self.ligne_compte_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "6"]
+
+    def _on_ligne_compte_keyrelease(self, event=None):
+        query = self._extract_code(self.ligne_compte_var.get())
+        if query:
+            items = self._appeler("search_accounts", query, limit=50)
+            if items is not APPEL_ECHEC:
+                self.ligne_compte_combo["values"] = [
+                    f"{a['code']} — {a['label']}" for a in items if a["classe"] == "6"]
+
+    def _refresh_ligne_analytic_values(self):
+        codes = self._appeler("list_analytic_codes")
+        if codes is not APPEL_ECHEC:
+            self.ligne_analytic_combo["values"] = [f"{c['code']} — {c['label']}" for c in codes]
+
+    def refresh_factures_list(self):
+        factures = self._appeler("list_factures_achat")
+        if factures is APPEL_ECHEC:
+            return
+        self.facture_combo["values"] = [f"{f['numero']} — {f['raison_sociale']} — {f['statut']}"
+                                         for f in factures]
+        self._factures_cache = factures
+        if self.current_facture_id is None and factures:
+            self.current_facture_id = factures[0]["id"]
+            self.facture_combo.current(0)
+        self.load_facture()
+
+    def _on_facture_selected(self, event=None):
+        idx = self.facture_combo.current()
+        if 0 <= idx < len(self._factures_cache):
+            self.current_facture_id = self._factures_cache[idx]["id"]
+        self.load_facture()
+
+    def load_facture(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        self.entete_text.delete("1.0", "end")
+        self.pied_text.delete("1.0", "end")
+        if not self.current_facture_id:
+            self.statut_var.set("Aucune facture — créez-en une nouvelle.")
+            self.totals_var.set("")
+            self.corriger_btn.configure(state="disabled")
+            return
+        f = self._appeler("get_facture_achat", self.current_facture_id)
+        if f is APPEL_ECHEC or not f:
+            self.current_facture_id = None
+            self.statut_var.set("")
+            self.corriger_btn.configure(state="disabled")
+            return
+        self.numero_var.set(f["numero"])
+        self.date_var.set(core.to_display_date(f["date_facture"]))
+        fournisseur = self._appeler("get_fournisseur", f["fournisseur_code"])
+        if fournisseur is APPEL_ECHEC:
+            return
+        self.fournisseur_var.set(
+            f"{f['fournisseur_code']} — {fournisseur['raison_sociale']}" if fournisseur else f["fournisseur_code"])
+        self.retenue_taux_var.set(str(f["retenue_taux"]))
+        self.retenue_compte_var.set(f["retenue_compte"])
+        self.date_paiement_prevu_var.set(core.to_display_date(f.get("date_paiement_prevu") or ""))
+        self.entete_text.insert("1.0", f["entete"] or "")
+        self.pied_text.insert("1.0", f["pied_page"] or "")
+        statut_label = "VALIDÉE (écritures envoyées en Saisie)" if f["statut"] == "validee" else "Brouillon"
+        if f.get("bon_commande_id") and f["statut"] != "validee":
+            statut_label += " — générée depuis un Bon de commande"
+        self.statut_var.set(f"Statut : {statut_label}")
+        self.corriger_btn.configure(state="normal" if f["statut"] == "validee" else "disabled")
+
+        lignes = self._appeler("list_lignes_facture_achat", self.current_facture_id)
+        if lignes is APPEL_ECHEC:
+            return
+        for l in lignes:
+            impact = {"marchandise": "Stock marchandises (31)", "matiere_premiere": "Stock matières (32)"}.get(
+                l["type_stock"], "Aucun (service)")
+            self.tree.insert("", "end", values=(
+                l["id"], l["compte_achat"], l["libelle"], impact,
+                f"{l['quantite']:g}", fmt_cfa(l["prix_unitaire"]), l.get("analytic_code") or "",
+                fmt_cfa(l["montant_ht"])))
+        totals = self._appeler("compute_facture_achat_totals", self.current_facture_id)
+        if totals is APPEL_ECHEC:
+            return
+        self.totals_var.set(
+            f"TOTAL HT : {fmt_cfa(totals['total_ht'])}    Retenue ({totals['retenue_taux']:g}%) : "
+            f"{fmt_cfa(totals['retenue_montant'])}    NET À PAYER : {fmt_cfa(totals['net_a_payer'])}")
+
+    def new_facture(self):
+        numero = simpledialog.askstring("Nouvelle facture", "N° de facture :", parent=self)
+        if not numero:
+            return
+        fournisseur_code = self._extract_code(self.fournisseur_var.get())
+        if not fournisseur_code:
+            messagebox.showinfo("Fournisseur requis",
+                                 "Choisissez d'abord un fournisseur existant dans le champ Fournisseur.",
+                                 parent=self)
+            return
+        date_str = core.to_iso_date(self.date_var.get().strip()) or date.today().strftime("%Y-%m-%d")
+        try:
+            retenue_taux = float(self.retenue_taux_var.get() or 0)
+        except ValueError:
+            retenue_taux = 0
+        retenue_compte = self._extract_code(self.retenue_compte_var.get()) or core.COMPTE_RETENUE_DEFAUT
+        fid = self._appeler("create_facture_achat", numero, date_str, fournisseur_code,
+                             retenue_taux=retenue_taux, retenue_compte=retenue_compte)
+        if fid is APPEL_ECHEC:
+            return
+        self.current_facture_id = fid
+        self.refresh_factures_list()
+
+    def save_facture(self):
+        if not self.current_facture_id:
+            messagebox.showinfo("Info", "Créez d'abord une facture.", parent=self)
+            return
+        try:
+            retenue_taux = float(self.retenue_taux_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Le taux de retenue doit être un nombre.", parent=self)
+            return
+        if self._appeler(
+            "update_facture_achat", self.current_facture_id,
+            numero=self.numero_var.get().strip(), date_facture=core.to_iso_date(self.date_var.get().strip()),
+            fournisseur_code=self._extract_code(self.fournisseur_var.get()),
+            entete=self.entete_text.get("1.0", "end").strip(), pied_page=self.pied_text.get("1.0", "end").strip(),
+            retenue_taux=retenue_taux, retenue_compte=self._extract_code(self.retenue_compte_var.get()) or "447800",
+        ) is APPEL_ECHEC:
+            return
+        self._appeler("set_setting", "retenue_taux_defaut", retenue_taux)
+        self._appeler("set_text_setting", "retenue_compte_defaut", self._extract_code(self.retenue_compte_var.get()))
+        messagebox.showinfo("Enregistré", "Facture enregistrée (brouillon).", parent=self)
+        self.refresh_factures_list()
+
+    def add_ligne(self):
+        if not self.current_facture_id:
+            messagebox.showinfo("Info", "Créez d'abord une facture.", parent=self)
+            return
+        compte = self._extract_code(self.ligne_compte_var.get())
+        libelle = self.ligne_libelle_var.get().strip()
+        if not compte or not libelle:
+            messagebox.showwarning("Champ manquant", "Compte d'achat et libellé sont obligatoires.", parent=self)
+            return
+        try:
+            qte = float(self.ligne_qte_var.get() or 0)
+            prix = float(self.ligne_prix_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Quantité et Prix unitaire doivent être des nombres.", parent=self)
+            return
+        analytic_code = self._extract_code(self.ligne_analytic_var.get()) or None
+        if self._appeler("add_ligne_facture_achat", self.current_facture_id, compte, libelle, qte, prix,
+                          analytic_code=analytic_code) is APPEL_ECHEC:
+            return
+        self.ligne_compte_var.set(""); self.ligne_libelle_var.set("")
+        self.ligne_qte_var.set("1"); self.ligne_prix_var.set(""); self.ligne_analytic_var.set("")
+        self.load_facture()
+
+    def delete_ligne(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une ligne.", parent=self)
+            return
+        ligne_id = int(self.tree.item(sel[0], "values")[0])
+        if self._appeler("delete_ligne_facture_achat", ligne_id) is APPEL_ECHEC:
+            return
+        self.load_facture()
+
+    def valider(self):
+        if not self.current_facture_id:
+            messagebox.showinfo("Info", "Créez d'abord une facture.", parent=self)
+            return
+        self.save_facture()
+        date_paiement_prevu = core.to_iso_date(self.date_paiement_prevu_var.get().strip())
+        if not date_paiement_prevu:
+            messagebox.showwarning(
+                "Date manquante",
+                "Renseignez la date de règlement prévu avant de valider — c'est elle qui déclenche la "
+                "comptabilisation et la visibilité dans Contrats/Trésorerie.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Confirmer la validation",
+            "Valider cette facture ? Les écritures comptables seront envoyées sur le serveur (débit "
+            "achats, crédit fournisseur, retenue à la source, et entrée de stock automatique pour les "
+            "lignes marchandises/matières premières). Cette action est définitive.", parent=self
+        ):
+            return
+        resultat = self._appeler("valider_facture_achat", self.current_facture_id,
+                                  date_paiement_prevu=date_paiement_prevu)
+        if resultat is APPEL_ECHEC:
+            return
+        msg = "Facture validée et écritures envoyées en Saisie."
+        if resultat:
+            msg += "\n\nAvertissements :\n" + "\n".join(resultat)
+        messagebox.showinfo("Validation terminée", msg, parent=self)
+        self.refresh_factures_list()
+
+    def delete_facture(self):
+        if not self.current_facture_id:
+            return
+        if messagebox.askyesno("Confirmer", "Supprimer cette facture ?", parent=self):
+            if self._appeler("delete_facture_achat", self.current_facture_id) is APPEL_ECHEC:
+                return
+            self.current_facture_id = None
+            self.refresh_factures_list()
+
+    def corriger_facture(self):
+        if not self.current_facture_id:
+            return
+        if not messagebox.askyesno(
+            "Corriger cette facture",
+            "Cette facture est déjà validée : ses écritures comptables (débit achats, crédit "
+            "fournisseur, retenue à la source, entrée de stock) vont être RETIRÉES de la Saisie et la "
+            "facture repassera en brouillon modifiable.\n\nVous pourrez alors corriger les chiffres puis "
+            "la revalider.\n\nContinuer ?", parent=self
+        ):
+            return
+        if self._appeler("devalider_facture_achat", self.current_facture_id) is APPEL_ECHEC:
+            return
+        messagebox.showinfo("Facture repassée en brouillon",
+                             "La facture est de nouveau modifiable. Corrigez les chiffres puis cliquez "
+                             "sur « Valider et envoyer en Saisie ».", parent=self)
+        self.refresh_factures_list()
+
+    def imprimer_facture(self):
+        if not self.current_facture_id:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une facture.", parent=self)
+            return
+        f = self._appeler("get_facture_achat", self.current_facture_id)
+        if f is APPEL_ECHEC or not f:
+            return
+        html = self._appeler("render_facture_achat_html" if f["statut"] == "validee" else "render_bon_commande_html",
+                              self.current_facture_id)
+        if html is APPEL_ECHEC:
+            return
+        import tempfile, webbrowser, os
+        path = os.path.join(tempfile.gettempdir(), f"facture_achat_{self.current_facture_id}.html")
+        with open(path, "w", encoding="utf-8") as f_out:
+            f_out.write(html)
+        webbrowser.open(f"file://{path}")
 
 
 class RemoteBordereauLivraisonTab(ttk.Frame):

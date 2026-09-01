@@ -231,6 +231,7 @@ class App(tk.Tk):
         register("contrats", ContratsTab)
         register("expression_besoin", ExpressionBesoinTab)
         register("ep_bon_commande", BonCommandeEPTab)
+        register("factures_frs", FacturesFrsTab)
         register("bordereau_livraison", BordereauLivraisonTab)
         register("reglements", ReglementTab)
         register("energie", AnalytiquePeriodeTab,
@@ -293,6 +294,7 @@ class App(tk.Tk):
             ("Contrats", "contrats"),
             ("Expression de besoin", "expression_besoin"),
             ("Bon de commande", "ep_bon_commande"),
+            ("Factures frs", "factures_frs"),
             ("Bordereau de livraison", "bordereau_livraison"),
             ("Règlements", "reglements"),
         ])
@@ -4603,11 +4605,14 @@ class TresorerieTab(ttk.Frame):
         notebook.pack(fill="both", expand=True, padx=16, pady=8)
         tab_banques = ttk.Frame(notebook)
         tab_engagements = ttk.Frame(notebook)
+        tab_echeances = ttk.Frame(notebook)
         notebook.add(tab_banques, text="Banques (Entrées / Sorties)")
         notebook.add(tab_engagements, text="Engagements à payer")
+        notebook.add(tab_echeances, text="Échéances (prévisionnel)")
 
         self._build_banques(tab_banques)
         self._build_engagements(tab_engagements)
+        self._build_echeances(tab_echeances)
         self.refresh()
 
     def _build_banques(self, parent):
@@ -4650,6 +4655,33 @@ class TresorerieTab(ttk.Frame):
         self.tree_engagements.tag_configure("total", background="#1F4E78", foreground="white", font=("Segoe UI", 9, "bold"))
         self.tree_engagements.pack(fill="both", expand=True, padx=8, pady=8)
 
+    def _build_echeances(self, parent):
+        ttk.Label(parent, text=(
+            "Toutes les factures (fournisseurs et clients) ayant une date de règlement prévue et pas "
+            "encore payées, triées par échéance — pour anticiper l'impact sur la trésorerie avant même "
+            "que le paiement bancaire soit enregistré."
+        ), foreground="#595959", wraplength=1050).pack(anchor="w", padx=8, pady=(8, 8))
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=8)
+        ttk.Label(top, text="À partir du (JJ/MM/AAAA) :").pack(side="left")
+        self.echeance_date_from_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(top, textvariable=self.echeance_date_from_var, width=12).pack(side="left", padx=4)
+        ttk.Button(top, text="Actualiser", command=self.refresh).pack(side="left", padx=8)
+
+        self.echeances_synthese_var = tk.StringVar()
+        ttk.Label(parent, textvariable=self.echeances_synthese_var, font=("Segoe UI", 11, "bold")).pack(
+            anchor="w", padx=8, pady=8)
+
+        cols = ("date", "type", "tiers", "piece", "montant", "cumule")
+        self.tree_echeances = ttk.Treeview(parent, columns=cols, show="headings", height=14)
+        headers = ["Échéance", "Type", "Tiers", "Pièce", "Montant (+ entrée / − sortie)", "Solde cumulé"]
+        widths = [90, 90, 220, 100, 200, 150]
+        for c, h, w in zip(cols, headers, widths):
+            self.tree_echeances.heading(c, text=h)
+            self.tree_echeances.column(c, width=w, anchor="w" if c in ("type", "tiers", "piece") else "e")
+        self.tree_echeances.tag_configure("retard", foreground="#B00020")
+        self.tree_echeances.pack(fill="both", expand=True, padx=8, pady=8)
+
     def refresh(self):
         for row in self.tree_banques.get_children():
             self.tree_banques.delete(row)
@@ -4684,6 +4716,19 @@ class TresorerieTab(ttk.Frame):
                 f"{fmt_cfa(d['total_engagements'])}  —  Solde après engagements : "
                 f"{fmt_cfa(d['solde_apres_engagements'])} — insuffisant pour faire face à tous les engagements.")
             self.synthese_label.configure(foreground="#B00020")
+
+        for row in self.tree_echeances.get_children():
+            self.tree_echeances.delete(row)
+        date_from = core.to_iso_date(self.echeance_date_from_var.get().strip())
+        e = core.compute_echeances_tresorerie(self.conn, date_from=date_from)
+        for l in e["lignes"]:
+            tag = ("retard",) if l["en_retard"] else ()
+            self.tree_echeances.insert("", "end", tags=tag, values=(
+                core.to_display_date(l["date_echeance"]), l["type"], l["tiers"], l["piece"],
+                fmt_cfa(l["montant"]), fmt_cfa(l["solde_cumule"])))
+        self.echeances_synthese_var.set(
+            f"Total entrées prévues : {fmt_cfa(e['total_entrees'])}   Total sorties prévues : "
+            f"{fmt_cfa(e['total_sorties'])}   Impact net sur la trésorerie : {fmt_cfa(e['impact_net'])}")
 
 
 class ParcAutoTab(ttk.Frame):
@@ -6938,6 +6983,16 @@ class FacturesFrsTab(ttk.Frame):
         self.retenue_preset_combo.bind("<Button-1>", self._open_dropdown)
         self._refresh_retenue_presets()
 
+        ttk.Label(info, text="Date de règlement prévu (JJ/MM/AAAA) :").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
+        self.date_paiement_prevu_var = tk.StringVar()
+        ttk.Entry(info, textvariable=self.date_paiement_prevu_var, width=14).grid(
+            row=3, column=2, sticky="w", padx=4, pady=(6, 0))
+        ttk.Label(info, text=(
+            "Obligatoire pour valider — dès qu'elle est renseignée, la facture est comptabilisée et "
+            "devient visible dans ENGAGEMENTS-PROJETS > Contrats et dans TRÉSORERIE."
+        ), foreground="#595959", wraplength=650).grid(row=3, column=3, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+
         form = ttk.LabelFrame(self, text="Ajouter une ligne (produit/service acheté — compte 6x)")
         form.pack(fill="x", padx=12, pady=6)
         ttk.Label(form, text="Compte d'achat :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
@@ -6983,8 +7038,8 @@ class FacturesFrsTab(ttk.Frame):
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=8)
-        ttk.Button(btns, text="Enregistrer BON DE COMMANDE", command=self.save_facture).pack(side="left", padx=2)
-        ttk.Button(btns, text="Aperçu avant impression (bon de commande)", command=self.imprimer_facture).pack(side="left", padx=2)
+        ttk.Button(btns, text="Enregistrer la facture", command=self.save_facture).pack(side="left", padx=2)
+        ttk.Button(btns, text="Aperçu avant impression (facture d'achat)", command=self.imprimer_facture).pack(side="left", padx=2)
         ttk.Button(btns, text="Valider et envoyer en Saisie", command=self.valider).pack(side="left", padx=2)
 
         self.refresh_factures_list()
@@ -7096,6 +7151,7 @@ class FacturesFrsTab(ttk.Frame):
             f"{f['fournisseur_code']} — {fournisseur['raison_sociale']}" if fournisseur else f["fournisseur_code"])
         self.retenue_taux_var.set(str(f["retenue_taux"]))
         self.retenue_compte_var.set(f["retenue_compte"])
+        self.date_paiement_prevu_var.set(core.to_display_date(f["date_paiement_prevu"] or ""))
         self.entete_text.insert("1.0", f["entete"] or "")
         self.pied_text.insert("1.0", f["pied_page"] or "")
         statut_label = "VALIDÉE (écritures envoyées en Saisie)" if f["statut"] == "validee" else "Brouillon"
@@ -7201,6 +7257,13 @@ class FacturesFrsTab(ttk.Frame):
         if not f:
             return
         self.save_facture()
+        date_paiement_prevu = core.to_iso_date(self.date_paiement_prevu_var.get().strip())
+        if not date_paiement_prevu:
+            messagebox.showwarning(
+                "Date manquante",
+                "Renseignez la date de règlement prévu avant de valider — c'est elle qui déclenche la "
+                "comptabilisation et la visibilité dans Contrats/Trésorerie.")
+            return
         if messagebox.askyesno(
             "Confirmer la validation",
             "Valider cette facture ? Les écritures comptables seront envoyées dans le menu SAISIE "
@@ -7208,7 +7271,8 @@ class FacturesFrsTab(ttk.Frame):
             "pour les lignes marchandises/matières premières). Cette action est définitive."
         ):
             try:
-                warnings = core.valider_facture_achat(self.conn, self.current_facture_id)
+                warnings = core.valider_facture_achat(self.conn, self.current_facture_id,
+                                                        date_paiement_prevu=date_paiement_prevu)
             except ValueError as exc:
                 messagebox.showerror("Erreur", str(exc))
                 return
@@ -7827,10 +7891,11 @@ class BonCommandeEPDialog(tk.Toplevel):
     def valider(self):
         if not messagebox.askyesno(
             "Valider ce bon de commande",
-            "Ce bon de commande va être verrouillé et COMPTABILISÉ DIRECTEMENT (débit des comptes de "
-            "charge choisis, crédit fournisseur, retenue fiscale éventuelle, entrée de stock automatique "
-            "si applicable) — l'écriture sera envoyée en Saisie. Un Bordereau de livraison sera aussi "
-            "créé pour le suivi de la réception.\n\nContinuer ?",
+            "Ce bon de commande va être verrouillé et va générer une FACTURE D'ACHAT (brouillon, non "
+            "comptabilisée) avec les lignes recopiées. Aucune écriture comptable n'est envoyée à ce "
+            "stade — c'est la validation de cette facture, avec sa date de règlement prévu (menu "
+            "ENGAGEMENTS-PROJETS > Factures frs), qui comptabilisera l'achat et créera le Bordereau de "
+            "livraison.\n\nContinuer ?",
             parent=self,
         ):
             return
@@ -7842,8 +7907,9 @@ class BonCommandeEPDialog(tk.Toplevel):
             return
         messagebox.showinfo(
             "Validé",
-            "Bon de commande validé et comptabilisé — écriture envoyée en Saisie. Le Bordereau de "
-            "livraison a été créé.",
+            "Bon de commande validé — une facture d'achat brouillon a été créée dans ENGAGEMENTS-PROJETS "
+            "> Factures frs. Complétez-la si besoin puis validez-la avec sa date de règlement prévu pour "
+            "comptabiliser l'achat et générer le Bordereau de livraison.",
             parent=self,
         )
         self.on_saved()
