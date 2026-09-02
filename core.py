@@ -3121,6 +3121,94 @@ def set_pointage_bancaire(conn, entry_id, pointe):
     conn.commit()
 
 
+def render_etat_rapprochement_html(conn, compte, date_from=None, date_to=None, solde_releve=None):
+    """État de rapprochement bancaire imprimable (aperçu avant impression,
+    à enregistrer en PDF via Ctrl+P) pour UN compte de banque : solde
+    comptable, liste des mouvements NON pointés (encore en attente sur le
+    relevé — chèques émis non débités, dépôts non encore crédités...),
+    et calcul du solde ajusté à comparer au solde du relevé bancaire
+    saisi par l'utilisateur. Renvoie le HTML en str (pas de fichier),
+    pour usage local (bureau) ET distant (client réseau)."""
+    comptes = compute_mouvements_prefixe_periode(conn, compte, date_from=date_from, date_to=date_to)
+    if not comptes:
+        raise ValueError(f"Aucun mouvement trouvé pour le compte {compte} sur cette période.")
+    c = comptes[0]
+    non_pointes = [m for m in c["mouvements"] if not m["pointe"]]
+    solde_comptable = c["solde_fin_periode"]
+    total_non_pointe = sum(m["debit"] - m["credit"] for m in non_pointes)
+    solde_ajuste = solde_comptable - total_non_pointe
+
+    societe_nom = get_company_value(conn, "societe_nom") or "(Dénomination non renseignée — ADMIN > Liasse fiscale)"
+    societe_adresse = get_company_value(conn, "societe_adresse")
+
+    lignes_html = "\n".join(
+        f"<tr><td>{to_display_date(m['date'])}</td><td>{m['piece'] or ''}</td><td>{m['libelle'] or ''}</td>"
+        f"<td style='text-align:right'>{m['debit']:,.0f}</td><td style='text-align:right'>{m['credit']:,.0f}</td></tr>"
+        for m in non_pointes
+    ) or "<tr><td colspan='5' style='text-align:center;color:#595959'>Aucun mouvement en attente — tout est pointé.</td></tr>"
+
+    solde_releve_html = ""
+    ecart_html = ""
+    if solde_releve is not None:
+        ecart = solde_ajuste - solde_releve
+        couleur = "#1F7A1F" if abs(ecart) < 1 else "#B00020"
+        solde_releve_html = f"<tr><td>Solde du relevé bancaire (saisi)</td><td style='text-align:right'>{solde_releve:,.0f}</td></tr>"
+        ecart_html = (f"<tr><td style='color:{couleur}'><b>Écart</b></td>"
+                       f"<td style='text-align:right;color:{couleur}'><b>{ecart:,.0f}</b></td></tr>")
+
+    date_from_disp = to_display_date(date_from) if date_from else "Début d'exercice"
+    date_to_disp = to_display_date(date_to) if date_to else "Aujourd'hui"
+
+    return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8"><title>État de rapprochement bancaire — {compte}</title>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 30px; color: #111; font-size: 13px; }}
+  .toolbar {{ margin-bottom: 16px; }}
+  .cadre-entreprise {{ border: 1px solid #000; padding: 8px 12px; text-align: center; margin-bottom: 10px; }}
+  .cadre-entreprise .nom {{ font-weight: bold; font-size: 15px; text-transform: uppercase; }}
+  h1 {{ font-size: 16px; text-align: center; margin: 10px 0; }}
+  .identite {{ border: 1px solid #000; padding: 8px 12px; margin-bottom: 12px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 12px; }}
+  th, td {{ border: 1px solid #000; padding: 5px 10px; font-size: 12px; }}
+  th {{ background: #eee; text-align: left; }}
+  table.totaux td:first-child {{ font-weight: bold; }}
+  table.totaux td:last-child {{ text-align: right; min-width: 130px; }}
+  @media print {{ .toolbar {{ display: none; }} }}
+</style></head>
+<body>
+<div class="toolbar"><button onclick="window.print()">🖨️ Imprimer / Enregistrer en PDF</button>
+  <span style="margin-left:10px;color:#595959;font-size:12px;">Aperçu avant impression — rien n'est encore imprimé.</span></div>
+
+<div class="cadre-entreprise">
+  <div class="nom">{societe_nom}</div>
+  <div>{societe_adresse or ''}</div>
+</div>
+<h1>ÉTAT DE RAPPROCHEMENT BANCAIRE</h1>
+<div class="identite">
+  <b>Compte :</b> {compte} — {c['label']}<br>
+  <b>Période :</b> du {date_from_disp} au {date_to_disp}
+</div>
+
+<table class="totaux">
+<tr><td>Solde comptable (fin de période)</td><td style="text-align:right">{solde_comptable:,.0f}</td></tr>
+<tr><td>Mouvements en attente sur le relevé (voir détail ci-dessous)</td><td style="text-align:right">{-total_non_pointe:,.0f}</td></tr>
+<tr><td>Solde ajusté (théorique)</td><td style="text-align:right"><b>{solde_ajuste:,.0f}</b></td></tr>
+{solde_releve_html}
+{ecart_html}
+</table>
+
+<p><b>Détail des mouvements en attente (non retrouvés sur le relevé bancaire) :</b></p>
+<table>
+<tr><th>Date</th><th>Pièce</th><th>Libellé</th><th>Débit</th><th>Crédit</th></tr>
+{lignes_html}
+</table>
+
+<p style="margin-top:30px;font-size:11px;color:#595959;">
+Document généré automatiquement à partir de la comptabilité — sert de justificatif du rapprochement
+entre le solde comptable et le solde du relevé bancaire.</p>
+</body></html>"""
+
+
 def _sum_accounts(balance, codes):
     """Somme Débit/Crédit pour tous les comptes dont le code COMMENCE PAR l'un
     des préfixes donnés (rétro-compatible : un préfixe de 6 chiffres ne

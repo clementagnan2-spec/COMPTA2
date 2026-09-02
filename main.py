@@ -5679,6 +5679,8 @@ class RapprochementCompteDialog(tk.Toplevel):
         releve_entry = ttk.Entry(filt, textvariable=self.solde_releve_var, width=16)
         releve_entry.pack(side="left")
         releve_entry.bind("<KeyRelease>", lambda e: self._maj_ecart())
+        ttk.Button(filt, text="📄 État de rapprochement (aperçu avant impression, PDF)",
+                   command=self.afficher_etat).pack(side="left", padx=(16, 0))
 
         cols = ("pointe", "date", "piece", "libelle", "debit", "credit", "solde")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=18)
@@ -5750,6 +5752,27 @@ class RapprochementCompteDialog(tk.Toplevel):
         self.ecart_var.set(f"Solde pointé (mouvements cochés) : {fmt_cfa(solde_pointe)} — "
                             f"saisissez le solde du relevé bancaire pour voir l'écart.")
         self.ecart_label.configure(foreground="black")
+
+    def afficher_etat(self):
+        solde_releve = None
+        if self.solde_releve_var.get().strip():
+            try:
+                solde_releve = float(self.solde_releve_var.get().replace(" ", "").replace(",", "."))
+            except ValueError:
+                pass
+        date_from = core.to_iso_date(self.date_from_var.get()) if self.date_from_var.get().strip() else None
+        date_to = core.to_iso_date(self.date_to_var.get()) if self.date_to_var.get().strip() else None
+        try:
+            html = core.render_etat_rapprochement_html(self.conn, self.compte, date_from=date_from,
+                                                         date_to=date_to, solde_releve=solde_releve)
+        except ValueError as exc:
+            messagebox.showerror("Erreur", str(exc), parent=self)
+            return
+        import tempfile, webbrowser, os
+        path = os.path.join(tempfile.gettempdir(), f"etat_rapprochement_{self.compte}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        webbrowser.open(f"file://{path}")
 
     def _on_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell":
