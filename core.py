@@ -9837,6 +9837,9 @@ def compute_tableau_bord_grh(conn):
 def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
     """Prévisionnel de trésorerie basé sur les échéances de paiement
     connues :
+    - bons de commande PAS ENCORE facturés (échéancier planifié, voir
+      set_echeancier_bon_commande) — anticipe la sortie même avant que la
+      facture ne soit générée/validée ;
     - fournisseurs dont le règlement est passé par le circuit Factures
       d'achat > Règlements : une ligne PAR TRANCHE de l'échéancier non
       encore payée (voir paiement_echeances/set_echeancier_reglement —
@@ -9846,14 +9849,42 @@ def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
       dette) ;
     - clients (factures_clients, entrées futures) dont le paiement n'a
       pas encore été enregistré.
-    Permet de voir l'impact des règlements à venir sur la trésorerie,
-    indépendamment du solde bancaire actuel. Trié par date d'échéance
-    croissante, avec solde cumulé (entrées - sorties)."""
+    Chaque ligne fournisseur porte aussi le(s) compte(s) de charge
+    concerné(s) (`compte_charge`). Permet de voir l'impact des règlements
+    à venir sur la trésorerie, indépendamment du solde bancaire actuel.
+    Trié par date d'échéance croissante, avec solde cumulé (entrées -
+    sorties)."""
     date_from = date_from or date.today().strftime("%Y-%m-%d")
     lignes = []
 
+    # Bons de commande dont la facture n'a pas encore été validée (donc pas encore
+    # dans paiement_echeances) — échéancier purement prévisionnel.
+    bons_deja_factures = {r["bon_commande_id"] for r in conn.execute(
+        "SELECT DISTINCT bon_commande_id FROM reglements WHERE bon_commande_id IS NOT NULL"
+    ).fetchall()}
+    for bon in list_ep_bons_commande(conn):
+        if bon["id"] in bons_deja_factures:
+            continue
+        tranches = list_echeances_bon_commande(conn, bon["id"])
+        if not tranches:
+            continue
+        comptes = sorted({l["compte_charge"] for l in list_lignes_ep_bon_commande(conn, bon["id"])
+                           if l["compte_charge"]})
+        for t in tranches:
+            if t["date_echeance"] < date_from:
+                continue
+            if date_to and t["date_echeance"] > date_to:
+                continue
+            lignes.append({
+                "date_echeance": t["date_echeance"], "type": "Fournisseur (prévisionnel)",
+                "tiers": bon.get("raison_sociale") or bon.get("fournisseur_code") or "",
+                "piece": bon["numero"] or "", "montant": -t["montant"],
+                "compte_charge": ", ".join(comptes) if comptes else "",
+                "en_retard": t["date_echeance"] < date.today().strftime("%Y-%m-%d"),
+            })
+
     echeances_rows = conn.execute(
-        """SELECT pe.*, r.numero AS reglement_numero, r.fournisseur_code
+        """SELECT pe.*, r.numero AS reglement_numero, r.fournisseur_code, r.id AS reglement_id
            FROM paiement_echeances pe JOIN reglements r ON r.id = pe.reglement_id
            WHERE pe.date_paiement_reel IS NULL"""
     ).fetchall()
@@ -9863,10 +9894,13 @@ def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
         if date_to and e["date_echeance"] > date_to:
             continue
         fournisseur = get_fournisseur(conn, e["fournisseur_code"]) if e["fournisseur_code"] else None
+        comptes = sorted({l["compte_charge"] for l in list_lignes_reglement(conn, e["reglement_id"])
+                           if l["compte_charge"]})
         lignes.append({
             "date_echeance": e["date_echeance"], "type": "Fournisseur",
             "tiers": fournisseur["raison_sociale"] if fournisseur else (e["fournisseur_code"] or ""),
             "piece": e["reglement_numero"] or "", "montant": -e["montant"],
+            "compte_charge": ", ".join(comptes) if comptes else "",
             "en_retard": e["date_echeance"] < date.today().strftime("%Y-%m-%d"),
         })
 
@@ -9882,7 +9916,7 @@ def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
         lignes.append({
             "date_echeance": c["date_echeance_paiement"], "type": "Fournisseur",
             "tiers": c["raison_sociale"], "piece": c["piece"] or "", "montant": -c["montant"],
-            "en_retard": c["depassement_paiement"],
+            "compte_charge": "", "en_retard": c["depassement_paiement"],
         })
     for f in list_factures(conn):
         if f["date_paiement_reel"] or not f["date_echeance_paiement"]:
@@ -9894,7 +9928,7 @@ def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
         lignes.append({
             "date_echeance": f["date_echeance_paiement"], "type": "Client",
             "tiers": f["raison_sociale"], "piece": f["piece"] or "", "montant": f["montant"],
-            "en_retard": f["depassement"],
+            "compte_charge": "", "en_retard": f["depassement"],
         })
     lignes.sort(key=lambda l: l["date_echeance"])
     solde_cumule = 0.0
@@ -9905,6 +9939,50 @@ def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
     total_sorties = sum(-l["montant"] for l in lignes if l["montant"] < 0)
     return {"lignes": lignes, "total_entrees": total_entrees, "total_sorties": total_sorties,
             "impact_net": total_entrees - total_sorties}
+
+
+def compute_echeances_tresorerie_pivot(conn, date_from=None, nb_mois=6):
+    """Prévisionnel de trésorerie par MOIS (Mois 1, Mois 2, ... + une
+    colonne « Au-delà ») — chaque ligne est un engagement (facture ou bon
+    de commande en attente), avec son tiers, sa pièce et son (ses)
+    compte(s) de charge, et le montant de chaque tranche placé dans la
+    colonne du mois correspondant à son échéance. Réutilise
+    compute_echeances_tresorerie() pour la collecte des données, seule la
+    présentation change (pivot par mois plutôt que liste chronologique)."""
+    date_from = date_from or date.today().strftime("%Y-%m-%d")
+    detail = compute_echeances_tresorerie(conn, date_from=date_from)
+
+    annee_ref, mois_ref = int(date_from[:4]), int(date_from[5:7])
+    colonnes = []
+    for i in range(nb_mois):
+        m = mois_ref + i
+        a = annee_ref + (m - 1) // 12
+        m = ((m - 1) % 12) + 1
+        colonnes.append(f"{MOIS_FR[m]} {a}")
+    colonnes.append("Au-delà")
+
+    groupes = {}
+    for l in detail["lignes"]:
+        annee_e, mois_e = int(l["date_echeance"][:4]), int(l["date_echeance"][5:7])
+        decalage = (annee_e - annee_ref) * 12 + (mois_e - mois_ref)
+        bucket = decalage if 0 <= decalage < nb_mois else nb_mois  # "Au-delà" si hors fenêtre
+        cle = (l["type"], l["tiers"], l["piece"], l.get("compte_charge", ""))
+        if cle not in groupes:
+            groupes[cle] = {
+                "type": l["type"], "tiers": l["tiers"], "piece": l["piece"],
+                "compte_charge": l.get("compte_charge", ""), "montants": [0.0] * (nb_mois + 1), "total": 0.0,
+            }
+        groupes[cle]["montants"][bucket] += l["montant"]
+        groupes[cle]["total"] += l["montant"]
+
+    lignes_pivot = sorted(groupes.values(), key=lambda g: (g["type"], g["tiers"]))
+    totaux_colonnes = [sum(l["montants"][i] for l in lignes_pivot) for i in range(nb_mois + 1)]
+    return {"colonnes": colonnes, "lignes": lignes_pivot, "totaux_colonnes": totaux_colonnes,
+            "total_general": sum(totaux_colonnes)}
+
+
+MOIS_FR = {1: "Janv.", 2: "Févr.", 3: "Mars", 4: "Avr.", 5: "Mai", 6: "Juin",
+           7: "Juil.", 8: "Août", 9: "Sept.", 10: "Oct.", 11: "Nov.", 12: "Déc."}
 
 
 def compute_tresorerie_banques_horizontal(conn, date_from=None, date_to=None, exercice=None):

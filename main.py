@@ -4657,29 +4657,30 @@ class TresorerieTab(ttk.Frame):
 
     def _build_echeances(self, parent):
         ttk.Label(parent, text=(
-            "Toutes les factures (fournisseurs et clients) ayant une date de règlement prévue et pas "
-            "encore payées, triées par échéance — pour anticiper l'impact sur la trésorerie avant même "
-            "que le paiement bancaire soit enregistré."
+            "Tous les engagements fournisseurs (bons de commande — même pas encore facturés — et "
+            "factures validées) et clients ayant une échéance de paiement pas encore réglée, répartis "
+            "par mois avec le(s) compte(s) de charge concerné(s) — pour anticiper l'impact sur la "
+            "trésorerie plusieurs mois à l'avance."
         ), foreground="#595959", wraplength=1050).pack(anchor="w", padx=8, pady=(8, 8))
         top = ttk.Frame(parent)
         top.pack(fill="x", padx=8)
         ttk.Label(top, text="À partir du (JJ/MM/AAAA) :").pack(side="left")
         self.echeance_date_from_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
         ttk.Entry(top, textvariable=self.echeance_date_from_var, width=12).pack(side="left", padx=4)
+        ttk.Label(top, text="Nombre de mois :").pack(side="left", padx=(12, 4))
+        self.echeance_nb_mois_var = tk.StringVar(value="6")
+        ttk.Entry(top, textvariable=self.echeance_nb_mois_var, width=4).pack(side="left")
         ttk.Button(top, text="Actualiser", command=self.refresh).pack(side="left", padx=8)
 
         self.echeances_synthese_var = tk.StringVar()
         ttk.Label(parent, textvariable=self.echeances_synthese_var, font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=8, pady=8)
 
-        cols = ("date", "type", "tiers", "piece", "montant", "cumule")
-        self.tree_echeances = ttk.Treeview(parent, columns=cols, show="headings", height=14)
-        headers = ["Échéance", "Type", "Tiers", "Pièce", "Montant (+ entrée / − sortie)", "Solde cumulé"]
-        widths = [90, 90, 220, 100, 200, 150]
-        for c, h, w in zip(cols, headers, widths):
-            self.tree_echeances.heading(c, text=h)
-            self.tree_echeances.column(c, width=w, anchor="w" if c in ("type", "tiers", "piece") else "e")
+        self.tree_echeances = ttk.Treeview(parent, show="headings", height=14)
+        self.tree_echeances.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree_echeances.tag_configure("retard", foreground="#B00020")
+        self.tree_echeances.tag_configure("total", background="#1F4E78", foreground="white",
+                                           font=("Segoe UI", 10, "bold"))
         self.tree_echeances.pack(fill="both", expand=True, padx=8, pady=8)
 
     def refresh(self):
@@ -4720,15 +4721,27 @@ class TresorerieTab(ttk.Frame):
         for row in self.tree_echeances.get_children():
             self.tree_echeances.delete(row)
         date_from = core.to_iso_date(self.echeance_date_from_var.get().strip())
-        e = core.compute_echeances_tresorerie(self.conn, date_from=date_from)
-        for l in e["lignes"]:
-            tag = ("retard",) if l["en_retard"] else ()
-            self.tree_echeances.insert("", "end", tags=tag, values=(
-                core.to_display_date(l["date_echeance"]), l["type"], l["tiers"], l["piece"],
-                fmt_cfa(l["montant"]), fmt_cfa(l["solde_cumule"])))
+        try:
+            nb_mois = max(1, min(12, int(self.echeance_nb_mois_var.get() or 6)))
+        except ValueError:
+            nb_mois = 6
+        p = core.compute_echeances_tresorerie_pivot(self.conn, date_from=date_from, nb_mois=nb_mois)
+        cols = ["type", "tiers", "piece", "compte"] + [f"mois{i}" for i in range(len(p["colonnes"]))] + ["total"]
+        self.tree_echeances["columns"] = cols
+        headers = ["Type", "Tiers", "Pièce", "Compte(s) de charge"] + p["colonnes"] + ["Total"]
+        widths = [140, 200, 90, 130] + [110] * len(p["colonnes"]) + [120]
+        for c, h, w in zip(cols, headers, widths):
+            self.tree_echeances.heading(c, text=h)
+            self.tree_echeances.column(c, width=w, anchor="w" if c in ("type", "tiers", "piece", "compte") else "e")
+        for l in p["lignes"]:
+            self.tree_echeances.insert("", "end", values=(
+                l["type"], l["tiers"], l["piece"], l["compte_charge"],
+                *[fmt_cfa(m) if m else "" for m in l["montants"]], fmt_cfa(l["total"])))
+        self.tree_echeances.insert("", "end", tags=("total",), values=(
+            "TOTAL", "", "", "", *[fmt_cfa(t) for t in p["totaux_colonnes"]], fmt_cfa(p["total_general"])))
         self.echeances_synthese_var.set(
-            f"Total entrées prévues : {fmt_cfa(e['total_entrees'])}   Total sorties prévues : "
-            f"{fmt_cfa(e['total_sorties'])}   Impact net sur la trésorerie : {fmt_cfa(e['impact_net'])}")
+            f"Sur les {nb_mois} prochains mois — impact net sur la trésorerie : "
+            f"{fmt_cfa(p['total_general'])} F CFA")
 
 
 class ParcAutoTab(ttk.Frame):
