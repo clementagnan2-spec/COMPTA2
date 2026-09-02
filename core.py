@@ -605,6 +605,15 @@ def init_db(conn):
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS facture_achat_echeances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            facture_id INTEGER NOT NULL,
+            numero_tranche INTEGER NOT NULL,
+            date_echeance TEXT NOT NULL,
+            montant REAL NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS bordereaux_livraison (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             numero TEXT NOT NULL,
@@ -5752,11 +5761,11 @@ def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=N
                              quantite=l["quantite"], prix_unitaire=l["prix_unitaire"],
                              analytic_code=l.get("analytic_code"))
     update_reglement(conn, reglement_id, statut="validee", piece=piece, facture_achat_id=facture_id)
-    # Échéancier : reprend les tranches planifiées au niveau du Bon de commande si elles
-    # existent (voir set_echeancier_bon_commande) ; sinon une seule tranche par défaut pour
-    # le net à payer, à la date de règlement prévu.
-    tranches_planifiees = list_echeances_bon_commande(conn, facture["bon_commande_id"]) if facture.get(
-        "bon_commande_id") else []
+    # Échéancier : reprend en priorité les tranches planifiées directement sur la facture
+    # (voir set_echeancier_facture_achat — copiées automatiquement depuis le Bon de commande
+    # à sa validation, ou définies directement sur la facture) ; sinon une seule tranche par
+    # défaut pour le net à payer, à la date de règlement prévu.
+    tranches_planifiees = list_echeances_facture_achat(conn, facture_id)
     if tranches_planifiees:
         set_echeancier_reglement(
             conn, reglement_id,
@@ -7368,6 +7377,59 @@ def set_echeancier_bon_commande(conn, bon_id, tranches):
     conn.commit()
 
 
+def list_echeances_facture_achat(conn, facture_id):
+    """Échéancier de paiement PLANIFIÉ (une ou plusieurs tranches) sur une
+    Facture d'achat en brouillon — purement prévisionnel à ce stade (rien
+    n'est encore comptabilisé) ; sera automatiquement repris sur le
+    Règlement dès que la facture sera validée (voir valider_facture_achat).
+    Repris automatiquement du Bon de commande d'origine s'il en avait un
+    (voir valider_ep_bon_commande)."""
+    rows = conn.execute(
+        "SELECT * FROM facture_achat_echeances WHERE facture_id = ? ORDER BY numero_tranche", (facture_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_echeancier_facture_achat(conn, facture_id, tranches):
+    """Définit (ou remplace) l'échéancier de paiement PRÉVU d'une Facture
+    d'achat en brouillon — un engagement payable en plusieurs fois sur
+    plusieurs mois. `tranches` : liste de dicts {date_echeance, montant}.
+    La somme doit correspondre au net à payer de la facture."""
+    facture = get_facture_achat(conn, facture_id)
+    if not facture:
+        raise ValueError("Facture introuvable.")
+    if not tranches:
+        raise ValueError("L'échéancier doit contenir au moins une tranche.")
+    totals = compute_facture_achat_totals(conn, facture_id)
+    total_tranches = 0.0
+    lignes_validees = []
+    for i, t in enumerate(tranches, start=1):
+        date_echeance = to_iso_date(t.get("date_echeance", ""))
+        if not date_echeance:
+            raise ValueError(f"Tranche {i} : date d'échéance invalide.")
+        try:
+            montant = float(t.get("montant") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Tranche {i} : montant invalide.")
+        if montant <= 0:
+            raise ValueError(f"Tranche {i} : le montant doit être strictement positif.")
+        total_tranches += montant
+        lignes_validees.append((date_echeance, montant))
+    if abs(total_tranches - totals["net_a_payer"]) > 1:
+        raise ValueError(
+            f"La somme des tranches ({total_tranches:,.0f}) doit correspondre au net à payer "
+            f"({totals['net_a_payer']:,.0f})."
+        )
+    conn.execute("DELETE FROM facture_achat_echeances WHERE facture_id = ?", (facture_id,))
+    for i, (date_echeance, montant) in enumerate(sorted(lignes_validees, key=lambda x: x[0]), start=1):
+        conn.execute(
+            "INSERT INTO facture_achat_echeances (facture_id, numero_tranche, date_echeance, montant) "
+            "VALUES (?, ?, ?, ?)",
+            (facture_id, i, date_echeance, montant),
+        )
+    conn.commit()
+
+
 def valider_ep_bon_commande(conn, bon_id):
     """Valide le Bon de commande : fait basculer le bon en FACTURE D'ACHAT
     (brouillon, lignes recopiées avec leur compte de charge/code
@@ -7411,6 +7473,15 @@ def valider_ep_bon_commande(conn, bon_id):
     conn.execute("UPDATE commandes_fournisseurs SET facture_achat_id = ? WHERE id = "
                  "(SELECT id FROM commandes_fournisseurs WHERE piece = ? ORDER BY id DESC LIMIT 1)",
                  (facture_id, bon["numero"]))
+
+    # Reprend l'échéancier planifié sur le Bon de commande (s'il y en avait un) directement
+    # sur la facture générée — visible et modifiable immédiatement dans ENGAGEMENTS-PROJETS >
+    # Factures frs, sans attendre la validation de la facture.
+    tranches_bon = list_echeances_bon_commande(conn, bon_id)
+    if tranches_bon:
+        set_echeancier_facture_achat(
+            conn, facture_id,
+            [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in tranches_bon])
 
     update_ep_bon_commande(conn, bon_id, statut="validee")
     conn.commit()
@@ -10003,26 +10074,24 @@ def compute_tresorerie_banques_horizontal(conn, date_from=None, date_to=None, ex
 
 def compute_engagements_a_payer(conn):
     """Liste des Règlements VALIDÉS (charge/dette fournisseur déjà
-    comptabilisée) dont le paiement bancaire n'a PAS encore été
-    comptabilisé (paiement_comptabilise = 0) — les engagements financiers
-    restant à honorer. Compare leur total au solde de trésorerie
-    disponible (classe 5) pour évaluer la capacité à y faire face."""
-    rows = conn.execute(
-        """SELECT r.*, COALESCE(f.raison_sociale, r.fournisseur_code, '') AS raison_sociale
-           FROM reglements r LEFT JOIN fournisseurs f ON f.code = r.fournisseur_code
-           WHERE r.statut = 'validee' AND r.paiement_comptabilise = 0
-           ORDER BY r.date_reglement"""
-    ).fetchall()
+    comptabilisée) dont il reste au moins une tranche d'échéancier non
+    payée — le montant affiché est le RESTANT DÛ (montant_restant), pas
+    le montant total de la facture, pour rester exact même en cas de
+    paiement partiel/fractionné (voir list_reglements_avec_statut_paiement).
+    Compare leur total au solde de trésorerie disponible (classe 5) pour
+    évaluer la capacité à y faire face."""
     engagements = []
     total_engagements = 0.0
-    for r in rows:
-        totals = compute_reglement_totals(conn, r["id"])
+    for r in list_reglements_avec_statut_paiement(conn):
+        if r["statut"] != "validee" or r["montant_restant"] <= 0.01:
+            continue
         engagements.append({
             "reglement_id": r["id"], "numero": r["numero"], "date_reglement": r["date_reglement"],
             "fournisseur_code": r["fournisseur_code"], "raison_sociale": r["raison_sociale"],
-            "net_a_payer": totals["net_a_payer"],
+            "net_a_payer": r["montant_restant"], "statut_paiement": r["statut_paiement"],
+            "en_retard": r["en_retard"],
         })
-        total_engagements += totals["net_a_payer"]
+        total_engagements += r["montant_restant"]
 
     balance = compute_balance(conn, only_with_movement=False)
     treso_disponible = sum(b["solde_cloture"] for b in balance if b["classe"] == "5")

@@ -3484,12 +3484,15 @@ class RemoteTresorerieTab(ttk.Frame):
             anchor="w", padx=16, pady=(4, 4))
         ttk.Label(self, text="Engagements à payer (règlements validés, non encore payés)",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(8, 2))
-        cols2 = ("numero", "date", "fournisseur", "montant")
+        cols2 = ("numero", "date", "fournisseur", "montant", "statut")
         self.tree_engagements = ttk.Treeview(self, columns=cols2, show="headings", height=10)
-        for c, h, w in zip(cols2, ["N° Règlement", "Date", "Fournisseur", "Montant net à payer"],
-                           [130, 100, 260, 160]):
+        for c, h, w in zip(cols2, ["N° Règlement", "Date", "Fournisseur", "Montant restant à payer", "Statut"],
+                           [130, 100, 220, 170, 220]):
             self.tree_engagements.heading(c, text=h)
             self.tree_engagements.column(c, width=w, anchor="w" if c != "montant" else "e")
+        self.tree_engagements.tag_configure("total", background="#1F4E78", foreground="white",
+                                             font=("Segoe UI", 9, "bold"))
+        self.tree_engagements.tag_configure("retard", foreground="#B00020")
         self.tree_engagements.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
         ttk.Label(self, text=(
@@ -3538,9 +3541,12 @@ class RemoteTresorerieTab(ttk.Frame):
         for row in self.tree_engagements.get_children():
             self.tree_engagements.delete(row)
         for e in d["engagements"]:
-            self.tree_engagements.insert("", "end", values=(
+            tag = ("retard",) if e.get("en_retard") else ()
+            self.tree_engagements.insert("", "end", tags=tag, values=(
                 e["numero"], core.to_display_date(e["date_reglement"]), e["raison_sociale"],
-                fmt_cfa(e["net_a_payer"])))
+                fmt_cfa(e["net_a_payer"]), e.get("statut_paiement", "")))
+        self.tree_engagements.insert("", "end", tags=("total",), values=(
+            "TOTAL ENGAGEMENTS", "", "", fmt_cfa(d["total_engagements"]), ""))
         etat = "✓ peut faire face" if d["peut_faire_face"] else "⚠ insuffisant"
         self.synthese_var.set(f"Trésorerie disponible : {fmt_cfa(d['treso_disponible'])}   —   Engagements : "
                                f"{fmt_cfa(d['total_engagements'])}   —   {etat}")
@@ -4693,6 +4699,109 @@ class RemoteContratsTab(ttk.Frame):
             ))
 
 
+class RemoteFactureEcheancierDialog(tk.Toplevel):
+    """Planifie l'échéancier de paiement PRÉVU d'une Facture d'achat en
+    brouillon via le réseau — équivalent réseau complet de
+    FactureEcheancierDialog (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection, facture_id, net_a_payer, on_saved):
+        super().__init__(parent)
+        self.remote = remote
+        self.facture_id = facture_id
+        self.net_a_payer = net_a_payer
+        self.on_saved = on_saved
+        self.title("Échéancier de paiement prévu")
+        self.geometry("560x420")
+        self.transient(parent)
+        self.grab_set()
+
+        ttk.Label(self, text=(
+            f"Net à payer : {fmt_cfa(net_a_payer)} F CFA — répartissez ce montant sur une ou plusieurs "
+            f"échéances prévues (purement planifié, rien n'est encore comptabilisé)."
+        ), wraplength=520, foreground="#595959").pack(anchor="w", padx=10, pady=(10, 6))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=10)
+        ttk.Label(form, text="Échéance (JJ/MM/AAAA) :").grid(row=0, column=0, sticky="w", padx=4)
+        self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(form, textvariable=self.date_var, width=12).grid(row=0, column=1, padx=4)
+        ttk.Label(form, text="Montant :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.montant_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.montant_var, width=14).grid(row=0, column=3, padx=4)
+        ttk.Button(form, text="Ajouter la tranche", command=self.ajouter_tranche).grid(row=0, column=4, padx=12)
+
+        self.tree = ttk.Treeview(self, columns=("date", "montant"), show="headings", height=8)
+        self.tree.heading("date", text="Échéance")
+        self.tree.heading("montant", text="Montant")
+        self.tree.column("date", width=140, anchor="w")
+        self.tree.column("montant", width=160, anchor="e")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Button(self, text="Retirer la tranche sélectionnée", command=self.retirer_tranche).pack(
+            anchor="w", padx=10)
+
+        self.total_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.total_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=10, pady=6)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Enregistrer l'échéancier", command=self.enregistrer).pack(side="left")
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="left", padx=8)
+
+        self.tranches = []
+        existantes = appeler(self, remote, "list_echeances_facture_achat", facture_id)
+        if existantes is not APPEL_ECHEC:
+            self.tranches = [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in existantes]
+        self._refresh_tree()
+
+    def _refresh_tree(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        total = 0.0
+        for t in self.tranches:
+            self.tree.insert("", "end", values=(core.to_display_date(t["date_echeance"]), fmt_cfa(t["montant"])))
+            total += t["montant"]
+        ecart = total - self.net_a_payer
+        etat = "✓ correspond au net à payer" if abs(ecart) < 1 else f"⚠ écart de {fmt_cfa(ecart)}"
+        self.total_var.set(f"Total des tranches : {fmt_cfa(total)} F CFA — {etat}")
+
+    def ajouter_tranche(self):
+        date_str = core.to_iso_date(self.date_var.get().strip())
+        if not date_str:
+            messagebox.showwarning("Champ manquant", "Date d'échéance invalide.", parent=self)
+            return
+        try:
+            montant = float(self.montant_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Le montant doit être un nombre.", parent=self)
+            return
+        if montant <= 0:
+            messagebox.showerror("Erreur", "Le montant doit être strictement positif.", parent=self)
+            return
+        self.tranches.append({"date_echeance": date_str, "montant": montant})
+        self.montant_var.set("")
+        self._refresh_tree()
+
+    def retirer_tranche(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        del self.tranches[idx]
+        self._refresh_tree()
+
+    def enregistrer(self):
+        if not self.tranches:
+            messagebox.showwarning("Vide", "Ajoutez au moins une tranche.", parent=self)
+            return
+        if appeler(self, self.remote, "set_echeancier_facture_achat", self.facture_id,
+                   self.tranches) is APPEL_ECHEC:
+            return
+        messagebox.showinfo("Enregistré", "Échéancier planifié sur le serveur.", parent=self)
+        self.on_saved()
+        self.destroy()
+
+
 class RemoteFacturesFrsTab(ttk.Frame):
     """Factures fournisseurs (achats) via le réseau — équivalent réseau
     complet de FacturesFrsTab (bureau) : reçoit les factures générées
@@ -4769,6 +4878,14 @@ class RemoteFacturesFrsTab(ttk.Frame):
             "Obligatoire pour valider — dès qu'elle est renseignée, la facture est comptabilisée sur le "
             "serveur et devient visible dans ENGAGEMENTS-PROJETS > Contrats et dans TRÉSORERIE."
         ), foreground="#595959", wraplength=650).grid(row=2, column=3, columnspan=3, sticky="w", padx=4, pady=(6, 0))
+
+        echeancier_frame = ttk.Frame(info)
+        echeancier_frame.grid(row=3, column=0, columnspan=6, sticky="we", padx=4, pady=(6, 0))
+        ttk.Button(echeancier_frame, text="Planifier un échéancier (plusieurs tranches, optionnel)",
+                   command=self.modifier_echeancier_facture).pack(side="left")
+        self.echeancier_apercu_var = tk.StringVar()
+        ttk.Label(echeancier_frame, textvariable=self.echeancier_apercu_var, foreground="#595959").pack(
+            side="left", padx=12)
 
         form = ttk.LabelFrame(self, text="Ajouter une ligne (produit/service acheté — compte 6x)")
         form.pack(fill="x", padx=12, pady=6)
@@ -4970,6 +5087,35 @@ class RemoteFacturesFrsTab(ttk.Frame):
         self.totals_var.set(
             f"TOTAL HT : {fmt_cfa(totals['total_ht'])}    Retenue ({totals['retenue_taux']:g}%) : "
             f"{fmt_cfa(totals['retenue_montant'])}    NET À PAYER : {fmt_cfa(totals['net_a_payer'])}")
+        self._refresh_echeancier_apercu()
+
+    def _refresh_echeancier_apercu(self):
+        if not self.current_facture_id:
+            self.echeancier_apercu_var.set("")
+            return
+        tranches = self._appeler("list_echeances_facture_achat", self.current_facture_id)
+        if tranches is APPEL_ECHEC:
+            return
+        if not tranches:
+            self.echeancier_apercu_var.set("Aucun échéancier planifié (paiement en une fois à la date ci-dessus).")
+        else:
+            self.echeancier_apercu_var.set(
+                f"{len(tranches)} tranche(s) planifiée(s) : " +
+                ", ".join(f"{core.to_display_date(t['date_echeance'])} ({fmt_cfa(t['montant'])})" for t in tranches))
+
+    def modifier_echeancier_facture(self):
+        if not self.current_facture_id:
+            messagebox.showinfo("Info", "Créez ou sélectionnez d'abord une facture.", parent=self)
+            return
+        totals = self._appeler("compute_facture_achat_totals", self.current_facture_id)
+        if totals is APPEL_ECHEC:
+            return
+        if totals["net_a_payer"] <= 0:
+            messagebox.showinfo("Info", "Ajoutez d'abord des lignes avec un montant avant de planifier "
+                                         "un échéancier.", parent=self)
+            return
+        RemoteFactureEcheancierDialog(self, self.remote, self.current_facture_id, totals["net_a_payer"],
+                                       self._refresh_echeancier_apercu)
 
     def new_facture(self):
         numero = simpledialog.askstring("Nouvelle facture", "N° de facture :", parent=self)
