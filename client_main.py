@@ -2306,23 +2306,42 @@ class RemoteReglementsTab(ttk.Frame):
                                "créé directement uniquement)", command=self.valider).pack(
             anchor="w", padx=16, pady=(4, 8))
 
-        paiement_frame = ttk.LabelFrame(self, text="Enregistrer le paiement du règlement sélectionné")
-        paiement_frame.pack(fill="x", padx=16, pady=(0, 8))
-        ttk.Label(paiement_frame, text="Date de paiement (JJ/MM/AAAA) :").grid(
-            row=0, column=0, sticky="w", padx=4, pady=4)
+        echeancier_frame = ttk.LabelFrame(self, text="Échéancier de paiement du règlement sélectionné")
+        echeancier_frame.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Label(echeancier_frame, text=(
+            "Une ou plusieurs tranches — pour un engagement payable en plusieurs fois sur plusieurs "
+            "mois plutôt qu'en un seul versement."
+        ), foreground="#595959", wraplength=1050).grid(row=0, column=0, columnspan=6, sticky="w", padx=4, pady=(4, 2))
+        ttk.Button(echeancier_frame, text="Modifier l'échéancier (plusieurs tranches possibles)",
+                   command=self.modifier_echeancier).grid(row=1, column=0, padx=4, pady=4, sticky="w")
+        cols_ech = ("id", "tranche", "date", "montant", "statut")
+        self.tree_echeances = ttk.Treeview(echeancier_frame, columns=cols_ech, show="headings", height=4)
+        headers_ech = ["ID", "Tranche", "Échéance", "Montant", "Statut"]
+        for c, h, w in zip(cols_ech, headers_ech, [0, 60, 100, 120, 100]):
+            self.tree_echeances.heading(c, text=h)
+            self.tree_echeances.column(c, width=w, anchor="w", stretch=(c != "id"))
+        self.tree_echeances.column("id", width=0, stretch=False)
+        self.tree_echeances["displaycolumns"] = ("tranche", "date", "montant", "statut")
+        self.tree_echeances.grid(row=2, column=0, columnspan=6, sticky="we", padx=4, pady=4)
+        self.tree_echeances.tag_configure("retard", foreground="#B00020")
+        self.tree_echeances.tag_configure("payee", foreground="#1F7A1F")
+
+        ttk.Label(echeancier_frame, text="Payer la tranche sélectionnée — Date :").grid(
+            row=3, column=0, sticky="w", padx=4, pady=(4, 4))
         self.date_paiement_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
-        ttk.Entry(paiement_frame, textvariable=self.date_paiement_var, width=12).grid(row=0, column=1, padx=4)
-        ttk.Label(paiement_frame, text="Compte banque/caisse :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(echeancier_frame, textvariable=self.date_paiement_var, width=12).grid(
+            row=3, column=1, padx=4, sticky="w")
+        ttk.Label(echeancier_frame, text="Compte banque/caisse :").grid(row=3, column=2, sticky="w", padx=(12, 4))
         self.compte_paiement_var = tk.StringVar()
-        self.compte_paiement_combo = ttk.Combobox(paiement_frame, textvariable=self.compte_paiement_var, width=30)
-        self.compte_paiement_combo.grid(row=0, column=3, padx=4)
+        self.compte_paiement_combo = ttk.Combobox(echeancier_frame, textvariable=self.compte_paiement_var, width=28)
+        self.compte_paiement_combo.grid(row=3, column=3, padx=4, sticky="w")
         self.compte_paiement_combo.bind("<KeyRelease>", self._on_compte_paiement_keyrelease)
         self._refresh_compte_paiement_values()
-        ttk.Button(paiement_frame, text="Enregistrer le paiement", command=self.enregistrer_paiement).grid(
-            row=0, column=4, padx=12)
+        ttk.Button(echeancier_frame, text="Enregistrer le paiement de cette tranche",
+                   command=self.enregistrer_paiement).grid(row=3, column=4, padx=12)
         self.paiement_statut_var = tk.StringVar()
-        ttk.Label(paiement_frame, textvariable=self.paiement_statut_var, foreground="#1F7A1F").grid(
-            row=1, column=0, columnspan=5, sticky="w", padx=4, pady=(2, 4))
+        ttk.Label(echeancier_frame, textvariable=self.paiement_statut_var, foreground="#1F7A1F").grid(
+            row=4, column=0, columnspan=6, sticky="w", padx=4, pady=(2, 4))
 
         ttk.Separator(self).pack(fill="x", padx=16, pady=4)
         ttk.Label(self, text="Règlements existants", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16)
@@ -2433,10 +2452,42 @@ class RemoteReglementsTab(ttk.Frame):
         messagebox.showinfo("Validé", "Règlement comptabilisé sur le serveur.", parent=self)
         self.refresh()
 
-    def enregistrer_paiement(self):
+    def refresh_echeances(self):
+        for row in self.tree_echeances.get_children():
+            self.tree_echeances.delete(row)
+        if not self.reglement_id_selectionne:
+            return
+        echeances = self._appeler("list_echeances_reglement", self.reglement_id_selectionne)
+        if echeances is APPEL_ECHEC:
+            return
+        for e in echeances:
+            tag = "payee" if e["statut"] == "Payée" else ("retard" if e["statut"] == "En retard" else "")
+            self.tree_echeances.insert("", "end", iid=str(e["id"]), tags=(tag,) if tag else (), values=(
+                e["id"], e["numero_tranche"], core.to_display_date(e["date_echeance"]),
+                fmt_cfa(e["montant"]), e["statut"]))
+        restant = sum(e["montant"] for e in echeances if e["statut"] != "Payée")
+        if restant <= 0 and echeances:
+            self.paiement_statut_var.set("✓ Toutes les tranches sont payées.")
+        else:
+            self.paiement_statut_var.set(f"Reste à payer : {fmt_cfa(restant)} F CFA." if echeances else "")
+
+    def modifier_echeancier(self):
         if not self.reglement_id_selectionne:
             messagebox.showinfo("Info", "Sélectionnez d'abord un règlement dans la liste.", parent=self)
             return
+        totals = self._appeler("compute_reglement_totals", self.reglement_id_selectionne)
+        if totals is APPEL_ECHEC:
+            return
+        RemoteEcheancierDialog(self, self.remote, self.reglement_id_selectionne, totals["net_a_payer"],
+                                self.refresh_echeances)
+
+    def enregistrer_paiement(self):
+        sel = self.tree_echeances.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une tranche dans l'échéancier ci-dessus.",
+                                 parent=self)
+            return
+        echeance_id = int(sel[0])
         date_paiement = core.to_iso_date(self.date_paiement_var.get().strip())
         if not date_paiement:
             messagebox.showwarning("Champ manquant", "Saisissez la date de paiement.", parent=self)
@@ -2445,11 +2496,13 @@ class RemoteReglementsTab(ttk.Frame):
         if not compte:
             messagebox.showwarning("Champ manquant", "Choisissez le compte banque ou caisse.", parent=self)
             return
-        montant = self._appeler("enregistrer_paiement_reglement", self.reglement_id_selectionne,
-                                 date_paiement, compte)
+        montant = self._appeler("enregistrer_paiement_echeance", echeance_id, date_paiement, compte)
         if montant is APPEL_ECHEC:
             return
-        self.paiement_statut_var.set(f"✓ Paiement de {fmt_cfa(montant)} F CFA comptabilisé sur le serveur.")
+        self.refresh_echeances()
+        messagebox.showinfo("Paiement comptabilisé",
+                             f"Paiement de {fmt_cfa(montant)} comptabilisé sur le serveur (Débit fournisseur, "
+                             f"Crédit banque/caisse).", parent=self)
         self.refresh()
 
     def _on_select_reglement(self, event=None):
@@ -2459,7 +2512,7 @@ class RemoteReglementsTab(ttk.Frame):
         v = self.tree.item(sel[0], "values")
         self.reglement_id_selectionne = int(v[0])
         self._refresh_lignes()
-        self.paiement_statut_var.set("")
+        self.refresh_echeances()
 
     def _refresh_lignes(self):
         for row in self.tree_lignes.get_children():
@@ -2487,6 +2540,110 @@ class RemoteReglementsTab(ttk.Frame):
             self.tree.insert("", "end", values=(
                 r["id"], r["numero"], core.to_display_date(r["date_reglement"]), r["raison_sociale"],
                 r["statut"], paiement))
+
+
+class RemoteEcheancierDialog(tk.Toplevel):
+    """Définit l'échéancier de paiement d'un Règlement via le réseau —
+    équivalent réseau complet de EcheancierDialog (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection, reglement_id, net_a_payer, on_saved):
+        super().__init__(parent)
+        self.remote = remote
+        self.reglement_id = reglement_id
+        self.net_a_payer = net_a_payer
+        self.on_saved = on_saved
+        self.title("Échéancier de paiement")
+        self.geometry("560x420")
+        self.transient(parent)
+        self.grab_set()
+
+        ttk.Label(self, text=(
+            f"Net à payer : {fmt_cfa(net_a_payer)} F CFA — répartissez ce montant sur une ou plusieurs "
+            f"échéances (la somme des tranches doit correspondre exactement)."
+        ), wraplength=520, foreground="#595959").pack(anchor="w", padx=10, pady=(10, 6))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=10)
+        ttk.Label(form, text="Échéance (JJ/MM/AAAA) :").grid(row=0, column=0, sticky="w", padx=4)
+        self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(form, textvariable=self.date_var, width=12).grid(row=0, column=1, padx=4)
+        ttk.Label(form, text="Montant :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.montant_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.montant_var, width=14).grid(row=0, column=3, padx=4)
+        ttk.Button(form, text="Ajouter la tranche", command=self.ajouter_tranche).grid(row=0, column=4, padx=12)
+
+        self.tree = ttk.Treeview(self, columns=("date", "montant"), show="headings", height=8)
+        self.tree.heading("date", text="Échéance")
+        self.tree.heading("montant", text="Montant")
+        self.tree.column("date", width=140, anchor="w")
+        self.tree.column("montant", width=160, anchor="e")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Button(self, text="Retirer la tranche sélectionnée", command=self.retirer_tranche).pack(
+            anchor="w", padx=10)
+
+        self.total_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.total_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=10, pady=6)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Enregistrer l'échéancier", command=self.enregistrer).pack(side="left")
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="left", padx=8)
+
+        self.tranches = []
+        existantes = appeler(self, remote, "list_echeances_reglement", reglement_id)
+        if existantes is not APPEL_ECHEC:
+            for e in existantes:
+                if e["statut"] != "Payée":
+                    self.tranches.append({"date_echeance": e["date_echeance"], "montant": e["montant"]})
+        self._refresh_tree()
+
+    def _refresh_tree(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        total = 0.0
+        for t in self.tranches:
+            self.tree.insert("", "end", values=(core.to_display_date(t["date_echeance"]), fmt_cfa(t["montant"])))
+            total += t["montant"]
+        ecart = total - self.net_a_payer
+        etat = "✓ correspond au net à payer" if abs(ecart) < 1 else f"⚠ écart de {fmt_cfa(ecart)}"
+        self.total_var.set(f"Total des tranches : {fmt_cfa(total)} F CFA — {etat}")
+
+    def ajouter_tranche(self):
+        date_str = core.to_iso_date(self.date_var.get().strip())
+        if not date_str:
+            messagebox.showwarning("Champ manquant", "Date d'échéance invalide.", parent=self)
+            return
+        try:
+            montant = float(self.montant_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Le montant doit être un nombre.", parent=self)
+            return
+        if montant <= 0:
+            messagebox.showerror("Erreur", "Le montant doit être strictement positif.", parent=self)
+            return
+        self.tranches.append({"date_echeance": date_str, "montant": montant})
+        self.montant_var.set("")
+        self._refresh_tree()
+
+    def retirer_tranche(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        del self.tranches[idx]
+        self._refresh_tree()
+
+    def enregistrer(self):
+        if not self.tranches:
+            messagebox.showwarning("Vide", "Ajoutez au moins une tranche.", parent=self)
+            return
+        if appeler(self, self.remote, "set_echeancier_reglement", self.reglement_id,
+                   self.tranches) is APPEL_ECHEC:
+            return
+        messagebox.showinfo("Enregistré", "Échéancier mis à jour sur le serveur.", parent=self)
+        self.on_saved()
+        self.destroy()
 
 
 class RemoteEtatFormuleTab(ttk.Frame):
@@ -4671,6 +4828,7 @@ class RemoteFacturesFrsTab(ttk.Frame):
             fournisseur_code=self._extract_code(self.fournisseur_var.get()),
             entete=self.entete_text.get("1.0", "end").strip(), pied_page=self.pied_text.get("1.0", "end").strip(),
             retenue_taux=retenue_taux, retenue_compte=self._extract_code(self.retenue_compte_var.get()) or "447800",
+            date_paiement_prevu=core.to_iso_date(self.date_paiement_prevu_var.get().strip()),
         ) is APPEL_ECHEC:
             return
         self._appeler("set_setting", "retenue_taux_defaut", retenue_taux)

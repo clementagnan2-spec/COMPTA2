@@ -636,6 +636,17 @@ def init_db(conn):
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS paiement_echeances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reglement_id INTEGER NOT NULL,
+            numero_tranche INTEGER NOT NULL,
+            date_echeance TEXT NOT NULL,
+            montant REAL NOT NULL,
+            date_paiement_reel TEXT,
+            compte_paiement TEXT
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS reglement_lignes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             reglement_id INTEGER NOT NULL,
@@ -5712,6 +5723,10 @@ def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=N
                              quantite=l["quantite"], prix_unitaire=l["prix_unitaire"],
                              analytic_code=l.get("analytic_code"))
     update_reglement(conn, reglement_id, statut="validee", piece=piece, facture_achat_id=facture_id)
+    # Échéance par défaut (une seule tranche, pour le net à payer) — remplaçable par un
+    # échéancier à plusieurs tranches via set_echeancier_reglement si le paiement doit
+    # être fractionné sur plusieurs mois.
+    set_echeancier_reglement(conn, reglement_id, [{"date_echeance": date_paiement_prevu, "montant": totals["net_a_payer"]}])
 
     return warnings
 
@@ -7565,10 +7580,14 @@ def valider_reglement(conn, reglement_id, exercice=None):
     fournisseur = get_fournisseur(conn, reglement["fournisseur_code"])
     tiers_label = fournisseur["raison_sociale"] if fournisseur else reglement["fournisseur_code"]
 
-    _comptabiliser_lignes_achat(conn, date_str, piece, "AC", reglement["fournisseur_code"], lignes, tiers_label,
-                                 retenue_taux=reglement["retenue_taux"], retenue_compte=reglement["retenue_compte"])
+    resultat = _comptabiliser_lignes_achat(conn, date_str, piece, "AC", reglement["fournisseur_code"], lignes,
+                                            tiers_label, retenue_taux=reglement["retenue_taux"],
+                                            retenue_compte=reglement["retenue_compte"])
 
     update_reglement(conn, reglement_id, statut="validee", piece=piece)
+    # Échéance par défaut (une seule tranche, à la date du règlement) — remplaçable par un
+    # échéancier à plusieurs tranches via set_echeancier_reglement.
+    set_echeancier_reglement(conn, reglement_id, [{"date_echeance": date_str, "montant": resultat["net_a_payer"]}])
     return []
 
 
@@ -7591,6 +7610,11 @@ def enregistrer_paiement_reglement(conn, reglement_id, date_paiement, compte_pai
         raise ValueError("Le compte de paiement doit être un compte de trésorerie (classe 5 — banque ou caisse).")
     if reglement["paiement_comptabilise"]:
         raise ValueError("Le paiement de ce règlement a déjà été comptabilisé.")
+    if list_echeances_reglement(conn, reglement_id):
+        raise ValueError(
+            "Ce règlement a un échéancier à plusieurs tranches — payez chaque tranche individuellement "
+            "(voir la liste des échéances) plutôt qu'en un seul versement."
+        )
 
     totals = compute_reglement_totals(conn, reglement_id)
     fournisseur = get_fournisseur(conn, reglement["fournisseur_code"])
@@ -7606,6 +7630,125 @@ def enregistrer_paiement_reglement(conn, reglement_id, date_paiement, compte_pai
     update_reglement(conn, reglement_id, date_paiement=date_paiement, compte_paiement=compte_paiement,
                       paiement_comptabilise=1)
     return totals["net_a_payer"]
+
+
+def list_echeances_reglement(conn, reglement_id):
+    """Échéancier (une ou plusieurs tranches de paiement) d'un règlement,
+    trié par date. Chaque tranche a un statut : « payée », « en retard »
+    (échéance dépassée sans paiement) ou « à venir »."""
+    rows = conn.execute(
+        "SELECT * FROM paiement_echeances WHERE reglement_id = ? ORDER BY numero_tranche", (reglement_id,)
+    ).fetchall()
+    today = date.today().strftime("%Y-%m-%d")
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d["date_paiement_reel"]:
+            d["statut"] = "Payée"
+        elif d["date_echeance"] < today:
+            d["statut"] = "En retard"
+        else:
+            d["statut"] = "À venir"
+        result.append(d)
+    return result
+
+
+def set_echeancier_reglement(conn, reglement_id, tranches):
+    """Définit (ou remplace) l'échéancier de paiement d'un règlement déjà
+    validé — un engagement payable en plusieurs fois sur plusieurs mois,
+    plutôt qu'en un seul versement. `tranches` : liste de dicts
+    {date_echeance (JJ/MM/AAAA ou AAAA-MM-JJ), montant}, dans l'ordre
+    chronologique souhaité. La somme des montants doit correspondre
+    exactement au net à payer du règlement. Remplace l'échéancier
+    existant s'il y en avait déjà un — impossible si des tranches sont
+    déjà payées (annulez d'abord leur paiement)."""
+    reglement = get_reglement(conn, reglement_id)
+    if not reglement:
+        raise ValueError("Règlement introuvable.")
+    if reglement["statut"] != "validee":
+        raise ValueError("Le règlement doit être validé avant de définir un échéancier.")
+    if not tranches:
+        raise ValueError("L'échéancier doit contenir au moins une tranche.")
+    existantes = list_echeances_reglement(conn, reglement_id)
+    if any(e["date_paiement_reel"] for e in existantes):
+        raise ValueError(
+            "Impossible de modifier l'échéancier : au moins une tranche a déjà été payée. "
+            "Annulez d'abord son paiement si vous devez la corriger."
+        )
+    totals = compute_reglement_totals(conn, reglement_id)
+    total_tranches = 0.0
+    lignes_validees = []
+    for i, t in enumerate(tranches, start=1):
+        date_echeance = to_iso_date(t.get("date_echeance", ""))
+        if not date_echeance:
+            raise ValueError(f"Tranche {i} : date d'échéance invalide.")
+        try:
+            montant = float(t.get("montant") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Tranche {i} : montant invalide.")
+        if montant <= 0:
+            raise ValueError(f"Tranche {i} : le montant doit être strictement positif.")
+        total_tranches += montant
+        lignes_validees.append((date_echeance, montant))
+    if abs(total_tranches - totals["net_a_payer"]) > 1:
+        raise ValueError(
+            f"La somme des tranches ({total_tranches:,.0f}) doit correspondre au net à payer "
+            f"({totals['net_a_payer']:,.0f})."
+        )
+    conn.execute("DELETE FROM paiement_echeances WHERE reglement_id = ?", (reglement_id,))
+    for i, (date_echeance, montant) in enumerate(sorted(lignes_validees, key=lambda x: x[0]), start=1):
+        conn.execute(
+            "INSERT INTO paiement_echeances (reglement_id, numero_tranche, date_echeance, montant) "
+            "VALUES (?, ?, ?, ?)",
+            (reglement_id, i, date_echeance, montant),
+        )
+    conn.commit()
+
+
+def enregistrer_paiement_echeance(conn, echeance_id, date_paiement, compte_paiement):
+    """Enregistre le paiement d'UNE tranche de l'échéancier (comptabilise
+    Débit fournisseur 401000 / Crédit banque-caisse, pour le montant de
+    cette seule tranche — les autres tranches restent à payer à leurs
+    propres échéances). Marque le règlement entier comme payé
+    (`paiement_comptabilise`) une fois TOUTES les tranches réglées."""
+    row = conn.execute("SELECT * FROM paiement_echeances WHERE id = ?", (echeance_id,)).fetchone()
+    if not row:
+        raise ValueError("Échéance introuvable.")
+    echeance = dict(row)
+    if echeance["date_paiement_reel"]:
+        raise ValueError("Cette tranche est déjà payée.")
+    reglement = get_reglement(conn, echeance["reglement_id"])
+    if not reglement or reglement["statut"] != "validee":
+        raise ValueError("Le règlement correspondant n'est pas validé.")
+    if not compte_paiement or not account_exists(conn, compte_paiement):
+        raise ValueError(f"Le compte de paiement « {compte_paiement} » n'existe pas.")
+    if account_racine(compte_paiement) != "5":
+        raise ValueError("Le compte de paiement doit être un compte de trésorerie (classe 5 — banque ou caisse).")
+    date_paiement = to_iso_date(date_paiement)
+    if not date_paiement:
+        raise ValueError("Date de paiement invalide.")
+    _check_exercice_editable(conn, date_paiement)
+
+    fournisseur = get_fournisseur(conn, reglement["fournisseur_code"])
+    tiers_label = fournisseur["raison_sociale"] if fournisseur else reglement["fournisseur_code"]
+    piece = reglement["piece"] or reglement["numero"]
+    libelle = f"Paiement règlement {piece} — tranche {echeance['numero_tranche']}"
+
+    add_entry(conn, date_paiement, piece, "BQ", "401000", tiers_label, libelle,
+              echeance["montant"], 0, fournisseur_code=reglement["fournisseur_code"])
+    add_entry(conn, date_paiement, piece, "BQ", compte_paiement, tiers_label, libelle,
+              0, echeance["montant"])
+
+    conn.execute(
+        "UPDATE paiement_echeances SET date_paiement_reel = ?, compte_paiement = ? WHERE id = ?",
+        (date_paiement, compte_paiement, echeance_id),
+    )
+    conn.commit()
+
+    toutes_payees = all(e["date_paiement_reel"] for e in list_echeances_reglement(conn, echeance["reglement_id"]))
+    if toutes_payees:
+        update_reglement(conn, echeance["reglement_id"], paiement_comptabilise=1)
+    return echeance["montant"]
 
 
 def devalider_paiement_reglement(conn, reglement_id):
@@ -9562,14 +9705,43 @@ def compute_tableau_bord_grh(conn):
 # ---------------------------------------------------------------------------
 def compute_echeances_tresorerie(conn, date_from=None, date_to=None):
     """Prévisionnel de trésorerie basé sur les échéances de paiement
-    connues — fournisseurs (commandes_fournisseurs, sorties futures) et
-    clients (factures_clients, entrées futures) dont le paiement n'a pas
-    encore été enregistré. Permet de voir l'impact des règlements à venir
-    sur la trésorerie, indépendamment du solde bancaire actuel. Trié par
-    date d'échéance croissante, avec solde cumulé (entrées - sorties)."""
+    connues :
+    - fournisseurs dont le règlement est passé par le circuit Factures
+      d'achat > Règlements : une ligne PAR TRANCHE de l'échéancier non
+      encore payée (voir paiement_echeances/set_echeancier_reglement —
+      gère nativement les paiements fractionnés sur plusieurs mois) ;
+    - engagements fournisseurs créés directement dans Contrats, sans
+      passer par une facture (pour ne jamais compter deux fois la même
+      dette) ;
+    - clients (factures_clients, entrées futures) dont le paiement n'a
+      pas encore été enregistré.
+    Permet de voir l'impact des règlements à venir sur la trésorerie,
+    indépendamment du solde bancaire actuel. Trié par date d'échéance
+    croissante, avec solde cumulé (entrées - sorties)."""
     date_from = date_from or date.today().strftime("%Y-%m-%d")
     lignes = []
+
+    echeances_rows = conn.execute(
+        """SELECT pe.*, r.numero AS reglement_numero, r.fournisseur_code
+           FROM paiement_echeances pe JOIN reglements r ON r.id = pe.reglement_id
+           WHERE pe.date_paiement_reel IS NULL"""
+    ).fetchall()
+    for e in echeances_rows:
+        if e["date_echeance"] < date_from:
+            continue
+        if date_to and e["date_echeance"] > date_to:
+            continue
+        fournisseur = get_fournisseur(conn, e["fournisseur_code"]) if e["fournisseur_code"] else None
+        lignes.append({
+            "date_echeance": e["date_echeance"], "type": "Fournisseur",
+            "tiers": fournisseur["raison_sociale"] if fournisseur else (e["fournisseur_code"] or ""),
+            "piece": e["reglement_numero"] or "", "montant": -e["montant"],
+            "en_retard": e["date_echeance"] < date.today().strftime("%Y-%m-%d"),
+        })
+
     for c in list_commandes(conn):
+        if c["facture_achat_id"]:
+            continue  # déjà compté ci-dessus via son échéancier de règlement
         if c["date_paiement_reel"] or not c["date_echeance_paiement"]:
             continue
         if c["date_echeance_paiement"] < date_from:
