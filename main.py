@@ -8859,44 +8859,54 @@ class ReglementDialog(tk.Toplevel):
 
 
 class ReglementTab(ttk.Frame):
-    """Liste des Règlements (menu ENGAGEMENTS-PROJETS) — créés automatiquement
-    en validant un Bon de commande du circuit interne. Double-clic pour
-    ouvrir, choisir un compte de charge et un code analytique par ligne,
-    une retenue fiscale, puis valider : C'EST ICI que la comptabilisation
-    a réellement lieu (écriture envoyée en Saisie)."""
+    """Liste des factures fournisseurs à régler (menu ENGAGEMENTS-PROJETS)
+    — créées automatiquement en validant une Facture d'achat (ou un Bon
+    de commande du circuit interne). Cliquez sur une ligne pour l'ouvrir :
+    procéder au paiement (choix de la banque) et à la ventilation dans
+    les comptes (compte de charge, code analytique, retenue fiscale)."""
+
+    FILTRES = ["Toutes", "Non soldées", "En retard", "Partiellement payées", "Soldées", "Brouillons"]
 
     def __init__(self, parent, conn):
         super().__init__(parent)
         self.conn = conn
         ttk.Label(self, text="RÈGLEMENTS", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
         ttk.Label(self, text=(
-            "Créés automatiquement en validant un Bon de commande (circuit interne). Double-cliquez sur "
-            "une ligne pour l'ouvrir : choisissez un compte de charge et un code analytique pour chaque "
-            "ligne, une retenue fiscale si applicable, puis validez — c'est cette étape, et elle seule, "
-            "qui envoie l'écriture comptable en Saisie."
+            "Une facture d'achat validée apparaît ici automatiquement, prête à être payée. Cliquez sur "
+            "une ligne pour choisir la banque et procéder au paiement (ou pour compléter la ventilation "
+            "— compte de charge, code analytique, retenue fiscale — si ce n'est pas déjà fait)."
         ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
 
         btn_bar = ttk.Frame(self)
         btn_bar.pack(fill="x", padx=16, pady=4)
-        ttk.Button(btn_bar, text="Actualiser", command=self.refresh).pack(side="left")
+        ttk.Button(btn_bar, text="Actualiser", command=self.refresh).pack(side="left", padx=(0, 12))
+        self.filtre_var = tk.StringVar(value="Toutes")
+        self.filtre_buttons = {}
+        for f in self.FILTRES:
+            b = ttk.Radiobutton(btn_bar, text=f, value=f, variable=self.filtre_var,
+                                 command=self.refresh)
+            b.pack(side="left", padx=4)
 
-        cols = ("numero", "date", "fournisseur", "nb_lignes", "statut")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=22)
-        headers = ["N°", "Date", "Fournisseur", "Lignes", "Statut"]
-        widths = [110, 100, 260, 70, 160]
+        cols = ("numero", "date", "fournisseur", "montant", "statut_validation", "statut_paiement")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=20)
+        headers = ["N°", "Date", "Fournisseur", "Montant", "Ventilation", "Paiement"]
+        widths = [110, 100, 240, 120, 170, 220]
         for c, h, w in zip(cols, headers, widths):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w")
+        self.tree.tag_configure("retard", foreground="#B00020")
+        self.tree.tag_configure("soldee", foreground="#1F7A1F")
         self.tree.pack(fill="both", expand=True, padx=16, pady=8)
-        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-1>", self._on_click)
         self._by_iid = {}
         self.refresh()
 
-    def _on_double_click(self, event=None):
-        sel = self.tree.selection()
-        if not sel:
+    def _on_click(self, event=None):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
             return
-        rid = self._by_iid.get(sel[0])
+        self.tree.selection_set(iid)
+        rid = self._by_iid.get(iid)
         if rid:
             ReglementDialog(self, self.conn, rid, on_saved=self.refresh)
 
@@ -8904,11 +8914,24 @@ class ReglementTab(ttk.Frame):
         for row in self.tree.get_children():
             self.tree.delete(row)
         self._by_iid = {}
-        for reg in core.list_reglements(self.conn):
-            nb = len(core.list_lignes_reglement(self.conn, reg["id"]))
-            statut = "Validé" if reg["statut"] == "validee" else "Brouillon — à compléter"
-            iid = self.tree.insert("", "end", values=(
-                reg["numero"], core.to_display_date(reg["date_reglement"]), reg["raison_sociale"], nb, statut,
+        filtre = self.filtre_var.get()
+        for reg in core.list_reglements_avec_statut_paiement(self.conn):
+            if filtre == "Non soldées" and reg["statut_paiement"] not in ("Non soldée", "En retard") and \
+                    "Partiellement" not in reg["statut_paiement"]:
+                continue
+            if filtre == "En retard" and not reg.get("en_retard"):
+                continue
+            if filtre == "Partiellement payées" and "Partiellement" not in reg["statut_paiement"]:
+                continue
+            if filtre == "Soldées" and reg["statut_paiement"] != "✓ Soldée":
+                continue
+            if filtre == "Brouillons" and reg["statut"] == "validee":
+                continue
+            statut_validation = "Validé" if reg["statut"] == "validee" else "Brouillon — à compléter"
+            tag = "retard" if reg.get("en_retard") else ("soldee" if reg["statut_paiement"] == "✓ Soldée" else "")
+            iid = self.tree.insert("", "end", tags=(tag,) if tag else (), values=(
+                reg["numero"], core.to_display_date(reg["date_reglement"]), reg["raison_sociale"],
+                fmt_cfa(reg["montant_total"]), statut_validation, reg["statut_paiement"],
             ))
             self._by_iid[iid] = reg["id"]
 

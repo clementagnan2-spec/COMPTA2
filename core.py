@@ -7545,6 +7545,48 @@ def list_reglements(conn):
     return [dict(r) for r in rows]
 
 
+def list_reglements_avec_statut_paiement(conn):
+    """Liste des règlements enrichie du montant total, du montant déjà
+    payé et d'un statut de paiement synthétique (Soldée / Partiellement
+    payée / Non soldée / Brouillon), à partir de l'échéancier de chacun
+    (voir list_echeances_reglement) — pour l'écran RÈGLEMENTS (filtrage
+    soldées/non soldées, clic pour ouvrir le paiement)."""
+    reglements = list_reglements(conn)
+    today = date.today().strftime("%Y-%m-%d")
+    for r in reglements:
+        if r["statut"] != "validee":
+            r["montant_total"] = 0.0
+            r["montant_paye"] = 0.0
+            r["montant_restant"] = 0.0
+            r["statut_paiement"] = "Brouillon — à compléter"
+            r["en_retard"] = False
+            continue
+        echeances = list_echeances_reglement(conn, r["id"])
+        total = sum(e["montant"] for e in echeances)
+        paye = sum(e["montant"] for e in echeances if e["date_paiement_reel"])
+        restant = total - paye
+        r["montant_total"] = total
+        r["montant_paye"] = paye
+        r["montant_restant"] = restant
+        r["en_retard"] = any(not e["date_paiement_reel"] and e["date_echeance"] < today for e in echeances)
+        if not echeances or restant <= 0.01:
+            r["statut_paiement"] = "✓ Soldée"
+        elif paye > 0.01:
+            r["statut_paiement"] = f"Partiellement payée ({fmt_cfa_core(paye)}/{fmt_cfa_core(total)})"
+        else:
+            r["statut_paiement"] = "En retard" if r["en_retard"] else "Non soldée"
+    return reglements
+
+
+def fmt_cfa_core(montant):
+    """Formatage F CFA minimal, sans dépendance à l'UI (utilisé dans les
+    libellés de statut générés côté serveur)."""
+    try:
+        return f"{montant:,.0f}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(montant)
+
+
 def add_ligne_reglement(conn, reglement_id, compte_charge, libelle, quantite, prix_unitaire=0, analytic_code=None):
     conn.execute(
         """INSERT INTO reglement_lignes (reglement_id, compte_charge, libelle, quantite, prix_unitaire,

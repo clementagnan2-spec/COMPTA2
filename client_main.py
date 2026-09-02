@@ -2344,14 +2344,24 @@ class RemoteReglementsTab(ttk.Frame):
             row=4, column=0, columnspan=6, sticky="w", padx=4, pady=(2, 4))
 
         ttk.Separator(self).pack(fill="x", padx=16, pady=4)
-        ttk.Label(self, text="Règlements existants", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16)
-        ttk.Button(self, text="Actualiser", command=self.refresh).pack(anchor="w", padx=16, pady=(2, 4))
-        cols = ("id", "numero", "date", "fournisseur", "statut", "paiement")
+        ttk.Label(self, text="Factures à régler", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16)
+        filtre_bar = ttk.Frame(self)
+        filtre_bar.pack(fill="x", padx=16, pady=(2, 4))
+        ttk.Button(filtre_bar, text="Actualiser", command=self.refresh).pack(side="left", padx=(0, 12))
+        self.filtre_var = tk.StringVar(value="Toutes")
+        for f in ["Toutes", "Non soldées", "En retard", "Partiellement payées", "Soldées", "Brouillons"]:
+            ttk.Radiobutton(filtre_bar, text=f, value=f, variable=self.filtre_var, command=self.refresh).pack(
+                side="left", padx=4)
+        cols = ("id", "numero", "date", "fournisseur", "montant", "statut", "paiement")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=10)
-        headers = ["ID", "Numéro", "Date", "Fournisseur", "Statut", "Paiement"]
-        for c, h, w in zip(cols, headers, [40, 100, 90, 220, 100, 140]):
+        headers = ["ID", "Numéro", "Date", "Fournisseur", "Montant", "Ventilation", "Paiement"]
+        for c, h, w in zip(cols, headers, [0, 100, 90, 220, 110, 150, 200]):
             self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="w")
+            self.tree.column(c, width=w, anchor="w", stretch=(c != "id"))
+        self.tree.column("id", width=0, stretch=False)
+        self.tree["displaycolumns"] = ("numero", "date", "fournisseur", "montant", "statut", "paiement")
+        self.tree.tag_configure("retard", foreground="#B00020")
+        self.tree.tag_configure("soldee", foreground="#1F7A1F")
         self.tree.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         self.tree.bind("<<TreeviewSelect>>", self._on_select_reglement)
         self.refresh()
@@ -2529,17 +2539,29 @@ class RemoteReglementsTab(ttk.Frame):
 
     def refresh(self):
         self._refresh_compte_values()
-        reglements = self._appeler("list_reglements")
+        reglements = self._appeler("list_reglements_avec_statut_paiement")
         if reglements is APPEL_ECHEC:
             return
         for row in self.tree.get_children():
             self.tree.delete(row)
+        filtre = self.filtre_var.get()
         for r in reglements:
-            paiement = "✓ Payé" if r.get("paiement_comptabilise") else (
-                "En attente" if r["statut"] == "validee" else "—")
-            self.tree.insert("", "end", values=(
+            if filtre == "Non soldées" and r["statut_paiement"] not in ("Non soldée", "En retard") and \
+                    "Partiellement" not in r["statut_paiement"]:
+                continue
+            if filtre == "En retard" and not r.get("en_retard"):
+                continue
+            if filtre == "Partiellement payées" and "Partiellement" not in r["statut_paiement"]:
+                continue
+            if filtre == "Soldées" and r["statut_paiement"] != "✓ Soldée":
+                continue
+            if filtre == "Brouillons" and r["statut"] == "validee":
+                continue
+            statut_validation = "Validé" if r["statut"] == "validee" else "Brouillon — à compléter"
+            tag = "retard" if r.get("en_retard") else ("soldee" if r["statut_paiement"] == "✓ Soldée" else "")
+            self.tree.insert("", "end", iid=str(r["id"]), tags=(tag,) if tag else (), values=(
                 r["id"], r["numero"], core.to_display_date(r["date_reglement"]), r["raison_sociale"],
-                r["statut"], paiement))
+                fmt_cfa(r["montant_total"]), statut_validation, r["statut_paiement"]))
 
 
 class RemoteEcheancierDialog(tk.Toplevel):
