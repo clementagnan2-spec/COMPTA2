@@ -6931,11 +6931,7 @@ class FacturesFrsTab(ttk.Frame):
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=8)
-        ttk.Label(top, text="Facture n° :").pack(side="left")
-        self.facture_combo = ttk.Combobox(top, width=40, state="readonly")
-        self.facture_combo.pack(side="left", padx=4)
-        self.facture_combo.bind("<<ComboboxSelected>>", self._on_facture_selected)
-        ttk.Button(top, text="Nouvelle facture", command=self.new_facture).pack(side="left", padx=8)
+        ttk.Button(top, text="Nouvelle facture", command=self.new_facture).pack(side="left", padx=2)
         ttk.Button(top, text="Supprimer cette facture", command=self.delete_facture).pack(side="left", padx=2)
         self.corriger_btn = ttk.Button(top, text="Corriger cette facture (erreur sur les chiffres)",
                                         command=self.corriger_facture)
@@ -6944,9 +6940,18 @@ class FacturesFrsTab(ttk.Frame):
         self.statut_var = tk.StringVar()
         ttk.Label(top, textvariable=self.statut_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=16)
 
-        ttk.Label(self, text="En-tête de la facture (modifiable) :").pack(anchor="w", padx=12)
-        self.entete_text = tk.Text(self, height=3, font=("Segoe UI", 10))
-        self.entete_text.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(self, text="Factures existantes — cliquez une ligne pour la charger ci-dessous :").pack(
+            anchor="w", padx=12)
+        cols_liste = ("id", "numero", "fournisseur", "date", "statut", "net_a_payer")
+        self.tree_factures = ttk.Treeview(self, columns=cols_liste, show="headings", height=5)
+        headers_liste = ["ID", "Numéro", "Fournisseur", "Date", "Statut", "Net à payer"]
+        for c, h, w in zip(cols_liste, headers_liste, [0, 100, 240, 90, 100, 120]):
+            self.tree_factures.heading(c, text=h)
+            self.tree_factures.column(c, width=w, anchor="w", stretch=(c != "id"))
+        self.tree_factures.column("id", width=0, stretch=False)
+        self.tree_factures["displaycolumns"] = ("numero", "fournisseur", "date", "statut", "net_a_payer")
+        self.tree_factures.pack(fill="x", padx=12, pady=(2, 8))
+        self.tree_factures.bind("<<TreeviewSelect>>", self._on_facture_selected)
 
         info = ttk.Frame(self)
         info.pack(fill="x", padx=12, pady=4)
@@ -7033,9 +7038,18 @@ class FacturesFrsTab(ttk.Frame):
         self.totals_var = tk.StringVar()
         ttk.Label(self, textvariable=self.totals_var, font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(8, 0))
 
-        ttk.Label(self, text="Pied de page de la facture (modifiable) :").pack(anchor="w", padx=12, pady=(8, 0))
-        self.pied_text = tk.Text(self, height=3, font=("Segoe UI", 10))
-        self.pied_text.pack(fill="x", padx=12, pady=(0, 8))
+        docs_frame = ttk.Frame(self)
+        docs_frame.pack(fill="x", padx=12, pady=(8, 0))
+        entete_col = ttk.Frame(docs_frame)
+        entete_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Label(entete_col, text="En-tête de la facture (modifiable, pour l'impression) :").pack(anchor="w")
+        self.entete_text = tk.Text(entete_col, height=2, font=("Segoe UI", 10))
+        self.entete_text.pack(fill="x", pady=(0, 8))
+        pied_col = ttk.Frame(docs_frame)
+        pied_col.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Label(pied_col, text="Pied de page de la facture (modifiable) :").pack(anchor="w")
+        self.pied_text = tk.Text(pied_col, height=2, font=("Segoe UI", 10))
+        self.pied_text.pack(fill="x", pady=(0, 8))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=8)
@@ -7096,12 +7110,22 @@ class FacturesFrsTab(ttk.Frame):
     # -- Gestion des factures --
     def refresh_factures_list(self):
         factures = core.list_factures_achat(self.conn)
-        values = [f"{f['numero']} — {f['raison_sociale']} — {f['statut']}" for f in factures]
-        self.facture_combo["values"] = values
         self._factures_cache = factures
+        for row in self.tree_factures.get_children():
+            self.tree_factures.delete(row)
+        for f in factures:
+            totals = core.compute_facture_achat_totals(self.conn, f["id"])
+            self.tree_factures.insert("", "end", iid=str(f["id"]), values=(
+                f["id"], f["numero"], f["raison_sociale"], core.to_display_date(f["date_facture"]),
+                f["statut"], fmt_cfa(totals["net_a_payer"])))
         if self.current_facture_id is None and factures:
             self.current_facture_id = factures[0]["id"]
-            self.facture_combo.current(0)
+            self.tree_factures.selection_set(str(self.current_facture_id))
+        elif self.current_facture_id is not None:
+            try:
+                self.tree_factures.selection_set(str(self.current_facture_id))
+            except tk.TclError:
+                pass
         self.load_facture()
 
     def new_facture(self):
@@ -7124,9 +7148,10 @@ class FacturesFrsTab(ttk.Frame):
         self.refresh_factures_list()
 
     def _on_facture_selected(self, event=None):
-        idx = self.facture_combo.current()
-        if 0 <= idx < len(self._factures_cache):
-            self.current_facture_id = self._factures_cache[idx]["id"]
+        sel = self.tree_factures.selection()
+        if not sel:
+            return
+        self.current_facture_id = int(sel[0])
         self.load_facture()
 
     def load_facture(self):
