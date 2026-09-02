@@ -4504,9 +4504,10 @@ class ArreteComptesTab(ttk.Frame):
 
         self.tab_banques = self._make_tab_tree(
             "Rapprochements bancaires",
-            "Solde comptable de chaque compte banque à la date d'arrêté — le pointage détaillé "
-            "mouvement par mouvement se fait dans TRESORERIE > Rapprochement bancaire.",
+            "Solde comptable de chaque compte banque à la date d'arrêté — cliquez une ligne pour pointer "
+            "ses mouvements par rapport au relevé bancaire.",
             ("compte", "libelle", "solde"), ["Compte", "Libellé", "Solde comptable"], [90, 320, 150])
+        self.tab_banques.bind("<<TreeviewSelect>>", self._on_select_banque)
 
         self.tab_impots = self._make_tab_tree(
             "Impôts & charges sociales",
@@ -4538,6 +4539,14 @@ class ArreteComptesTab(ttk.Frame):
         tree.tag_configure("alerte", foreground="#B00020")
         tree.pack(fill="x", padx=8, pady=(0, 8))
         return tree
+
+    def _on_select_banque(self, event=None):
+        sel = self.tab_banques.selection()
+        if not sel:
+            return
+        v = self.tab_banques.item(sel[0], "values")
+        compte, libelle = v[0], v[1]
+        RapprochementCompteDialog(self, self.conn, compte, libelle, on_saved=self.calculer)
 
     def calculer(self):
         date_str = core.to_iso_date(self.date_var.get().strip())
@@ -5630,6 +5639,130 @@ class ClassePeriodeTab(ttk.Frame):
         periode = f"du {self.date_from_var.get()} au {self.date_to_var.get()}" if date_from or date_to else \
             f"exercice {core.get_current_exercice(self.conn)} entier"
         self.total_var.set(f"{len(comptes)} compte(s) avec solde ou mouvement — période : {periode}.")
+
+
+class RapprochementCompteDialog(tk.Toplevel):
+    """Rapprochement bancaire d'UN SEUL compte — ouvert en cliquant une
+    ligne dans RAPPORTS FINANCIERS > Arrêté de comptes > Rapprochements
+    bancaires (ou directement depuis TRESORERIE > Rapprochement
+    bancaire). Chaque mouvement a une case à cocher (retrouvé dans le
+    relevé papier) ; le solde recalculé au fur et à mesure se compare au
+    solde du relevé bancaire saisi, pour converger vers zéro d'écart."""
+
+    def __init__(self, parent, conn, compte, libelle, on_saved=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.compte = compte
+        self.on_saved = on_saved
+        self.title(f"Rapprochement bancaire — {compte} {libelle}")
+        self.geometry("820x600")
+        self.transient(parent)
+        self.grab_set()
+        self._row_entry_ids = {}
+
+        ttk.Label(self, text=f"{compte} — {libelle}", font=("Segoe UI", 13, "bold")).pack(
+            anchor="w", padx=12, pady=(12, 4))
+
+        filt = ttk.Frame(self)
+        filt.pack(fill="x", padx=12, pady=4)
+        ttk.Label(filt, text="Du (JJ/MM/AAAA) :").pack(side="left")
+        self.date_from_var = tk.StringVar()
+        ttk.Entry(filt, textvariable=self.date_from_var, width=12).pack(side="left", padx=4)
+        ttk.Label(filt, text="Au (JJ/MM/AAAA) :").pack(side="left", padx=(12, 0))
+        self.date_to_var = tk.StringVar()
+        ttk.Entry(filt, textvariable=self.date_to_var, width=12).pack(side="left", padx=4)
+        ttk.Button(filt, text="Afficher", command=self.refresh).pack(side="left", padx=8)
+        ttk.Label(filt, text="Solde du relevé bancaire :").pack(side="left", padx=(20, 4))
+        self.solde_releve_var = tk.StringVar()
+        releve_entry = ttk.Entry(filt, textvariable=self.solde_releve_var, width=16)
+        releve_entry.pack(side="left")
+        releve_entry.bind("<KeyRelease>", lambda e: self._maj_ecart())
+
+        cols = ("pointe", "date", "piece", "libelle", "debit", "credit", "solde")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=18)
+        headers = ["Pointé", "Date", "Pièce", "Libellé", "Débit", "Crédit", "Solde cumulé"]
+        widths = [55, 85, 70, 260, 100, 100, 120]
+        for c, h, w in zip(cols, headers, widths):
+            self.tree.heading(c, text=h)
+            anchor = "center" if c in ("pointe", "debit", "credit", "solde") else "w"
+            self.tree.column(c, width=w, anchor=anchor)
+        self.tree.tag_configure("pointe", background="#D9EAD3")
+        self.tree.pack(fill="both", expand=True, padx=12, pady=8)
+        self.tree.bind("<Button-1>", self._on_click)
+
+        self.synthese_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.synthese_var, font=("Segoe UI", 11, "bold")).pack(
+            anchor="w", padx=12, pady=(0, 4))
+        self.ecart_var = tk.StringVar()
+        self.ecart_label = ttk.Label(self, textvariable=self.ecart_var, font=("Segoe UI", 12, "bold"))
+        self.ecart_label.pack(anchor="w", padx=12, pady=(0, 12))
+
+        self.refresh()
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        self._row_entry_ids = {}
+        date_from = core.to_iso_date(self.date_from_var.get()) if self.date_from_var.get().strip() else None
+        date_to = core.to_iso_date(self.date_to_var.get()) if self.date_to_var.get().strip() else None
+        comptes = core.compute_mouvements_prefixe_periode(self.conn, self.compte, date_from=date_from,
+                                                            date_to=date_to)
+        if not comptes:
+            self.synthese_var.set("Aucun mouvement sur cette période pour ce compte.")
+            self.ecart_var.set("")
+            return
+        c = comptes[0]
+        for m in c["mouvements"]:
+            iid = self.tree.insert("", "end", tags=("pointe",) if m["pointe"] else (), values=(
+                "☑" if m["pointe"] else "☐", core.to_display_date(m["date"]), m["piece"] or "",
+                m["libelle"] or "", f"{fmt_cfa(m['debit'])}" if m["debit"] else "",
+                f"{fmt_cfa(m['credit'])}" if m["credit"] else "", f"{fmt_cfa(m['solde_cumule'])}",
+            ))
+            self._row_entry_ids[iid] = m["id"]
+        self._solde_debut = c["solde_debut_periode"]
+        self._total_pointe = c["total_pointe"]
+        self._solde_fin = c["solde_fin_periode"]
+        self.synthese_var.set(
+            f"Solde comptable début de période : {fmt_cfa(self._solde_debut)}    "
+            f"Solde comptable fin de période : {fmt_cfa(self._solde_fin)}")
+        self._maj_ecart()
+
+    def _maj_ecart(self):
+        solde_pointe = self._solde_debut + self._total_pointe
+        self.solde_pointe_actuel = solde_pointe
+        if self.solde_releve_var.get().strip():
+            try:
+                solde_releve = float(self.solde_releve_var.get().replace(" ", "").replace(",", "."))
+                ecart = solde_pointe - solde_releve
+                if abs(ecart) < 1:
+                    self.ecart_var.set(f"Solde pointé : {fmt_cfa(solde_pointe)}  —  ✓ Rapprochement OK "
+                                        f"(écart : {fmt_cfa(ecart)})")
+                    self.ecart_label.configure(foreground="#1F7A1F")
+                else:
+                    self.ecart_var.set(f"Solde pointé : {fmt_cfa(solde_pointe)}  —  Écart avec le relevé : "
+                                        f"{fmt_cfa(ecart)}")
+                    self.ecart_label.configure(foreground="#B00020")
+                return
+            except ValueError:
+                pass
+        self.ecart_var.set(f"Solde pointé (mouvements cochés) : {fmt_cfa(solde_pointe)} — "
+                            f"saisissez le solde du relevé bancaire pour voir l'écart.")
+        self.ecart_label.configure(foreground="black")
+
+    def _on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.tree.identify_column(event.x) != "#1":
+            return
+        row = self.tree.identify_row(event.y)
+        if row not in self._row_entry_ids:
+            return
+        entry_id = self._row_entry_ids[row]
+        deja_pointe = self.tree.set(row, "pointe") == "☑"
+        core.set_pointage_bancaire(self.conn, entry_id, not deja_pointe)
+        self.refresh()
+        if self.on_saved:
+            self.on_saved()
 
 
 class RapprochementBancaireTab(ttk.Frame):
