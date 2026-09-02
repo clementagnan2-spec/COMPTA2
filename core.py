@@ -596,6 +596,15 @@ def init_db(conn):
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS bon_commande_echeances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bon_commande_id INTEGER NOT NULL,
+            numero_tranche INTEGER NOT NULL,
+            date_echeance TEXT NOT NULL,
+            montant REAL NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS bordereaux_livraison (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             numero TEXT NOT NULL,
@@ -5579,11 +5588,23 @@ def list_factures_achat(conn):
 
 
 def add_ligne_facture_achat(conn, facture_id, compte_achat, libelle, quantite, prix_unitaire, analytic_code=None):
+    if not account_exists(conn, compte_achat):
+        raise ValueError(
+            f"Le compte « {compte_achat} » n'existe pas dans le plan comptable — "
+            f"choisissez un compte dans la liste plutôt que de le saisir librement."
+        )
+    if not quantite or float(quantite) <= 0:
+        raise ValueError("La quantité doit être strictement positive.")
+    if not prix_unitaire or float(prix_unitaire) <= 0:
+        raise ValueError(
+            "Le prix unitaire doit être strictement positif — vérifiez que vous n'avez pas laissé "
+            "ce champ vide par erreur."
+        )
     conn.execute(
         """INSERT INTO facture_achat_lignes (facture_id, compte_achat, libelle, quantite, prix_unitaire,
                                                analytic_code)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (facture_id, compte_achat, libelle, quantite or 0, prix_unitaire or 0, analytic_code or None),
+        (facture_id, compte_achat, libelle, quantite, prix_unitaire, analytic_code or None),
     )
     conn.commit()
 
@@ -5651,6 +5672,14 @@ def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=N
         raise ValueError("La date de règlement prévue est obligatoire pour valider une facture d'achat.")
 
     totals = compute_facture_achat_totals(conn, facture_id)
+    if totals["net_a_payer"] <= 0:
+        lignes_nulles = [l["libelle"] for l in lignes if not l["montant_ht"]]
+        detail = (" — ligne(s) à corriger : " + ", ".join(lignes_nulles)) if lignes_nulles else ""
+        raise ValueError(
+            f"Le total de la facture (net à payer) est de zéro — vérifiez que chaque ligne a bien une "
+            f"quantité et un prix unitaire renseignés, et que la dernière ligne tapée a été ajoutée "
+            f"avec le bouton « Ajouter la ligne » avant de valider{detail}."
+        )
     date_str = facture["date_facture"]
     piece = facture["numero"]
     warnings = []
@@ -5723,10 +5752,18 @@ def valider_facture_achat(conn, facture_id, date_paiement_prevu=None, exercice=N
                              quantite=l["quantite"], prix_unitaire=l["prix_unitaire"],
                              analytic_code=l.get("analytic_code"))
     update_reglement(conn, reglement_id, statut="validee", piece=piece, facture_achat_id=facture_id)
-    # Échéance par défaut (une seule tranche, pour le net à payer) — remplaçable par un
-    # échéancier à plusieurs tranches via set_echeancier_reglement si le paiement doit
-    # être fractionné sur plusieurs mois.
-    set_echeancier_reglement(conn, reglement_id, [{"date_echeance": date_paiement_prevu, "montant": totals["net_a_payer"]}])
+    # Échéancier : reprend les tranches planifiées au niveau du Bon de commande si elles
+    # existent (voir set_echeancier_bon_commande) ; sinon une seule tranche par défaut pour
+    # le net à payer, à la date de règlement prévu.
+    tranches_planifiees = list_echeances_bon_commande(conn, facture["bon_commande_id"]) if facture.get(
+        "bon_commande_id") else []
+    if tranches_planifiees:
+        set_echeancier_reglement(
+            conn, reglement_id,
+            [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in tranches_planifiees])
+    else:
+        set_echeancier_reglement(conn, reglement_id,
+                                  [{"date_echeance": date_paiement_prevu, "montant": totals["net_a_payer"]}])
 
     return warnings
 
@@ -7277,6 +7314,58 @@ def compute_ep_bon_commande_totals(conn, bon_id):
     net_a_payer = total_ht - retenue_montant
     return {"total_ht": total_ht, "retenue_taux": retenue_taux, "retenue_montant": retenue_montant,
             "net_a_payer": net_a_payer}
+
+
+def list_echeances_bon_commande(conn, bon_id):
+    """Échéancier de paiement PLANIFIÉ (une ou plusieurs tranches) sur un
+    Bon de commande — purement prévisionnel à ce stade (rien n'est encore
+    comptabilisé) ; sera automatiquement recopié sur le Règlement dès que
+    la facture générée sera validée (voir valider_facture_achat)."""
+    rows = conn.execute(
+        "SELECT * FROM bon_commande_echeances WHERE bon_commande_id = ? ORDER BY numero_tranche", (bon_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_echeancier_bon_commande(conn, bon_id, tranches):
+    """Définit (ou remplace) l'échéancier de paiement PRÉVU d'un Bon de
+    commande — un engagement payable en plusieurs fois sur plusieurs mois,
+    planifié dès la commande plutôt qu'à la validation de la facture.
+    `tranches` : liste de dicts {date_echeance, montant}. La somme doit
+    correspondre au net à payer du bon de commande."""
+    bon = get_ep_bon_commande(conn, bon_id)
+    if not bon:
+        raise ValueError("Bon de commande introuvable.")
+    if not tranches:
+        raise ValueError("L'échéancier doit contenir au moins une tranche.")
+    totals = compute_ep_bon_commande_totals(conn, bon_id)
+    total_tranches = 0.0
+    lignes_validees = []
+    for i, t in enumerate(tranches, start=1):
+        date_echeance = to_iso_date(t.get("date_echeance", ""))
+        if not date_echeance:
+            raise ValueError(f"Tranche {i} : date d'échéance invalide.")
+        try:
+            montant = float(t.get("montant") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Tranche {i} : montant invalide.")
+        if montant <= 0:
+            raise ValueError(f"Tranche {i} : le montant doit être strictement positif.")
+        total_tranches += montant
+        lignes_validees.append((date_echeance, montant))
+    if abs(total_tranches - totals["net_a_payer"]) > 1:
+        raise ValueError(
+            f"La somme des tranches ({total_tranches:,.0f}) doit correspondre au net à payer "
+            f"({totals['net_a_payer']:,.0f})."
+        )
+    conn.execute("DELETE FROM bon_commande_echeances WHERE bon_commande_id = ?", (bon_id,))
+    for i, (date_echeance, montant) in enumerate(sorted(lignes_validees, key=lambda x: x[0]), start=1):
+        conn.execute(
+            "INSERT INTO bon_commande_echeances (bon_commande_id, numero_tranche, date_echeance, montant) "
+            "VALUES (?, ?, ?, ?)",
+            (bon_id, i, date_echeance, montant),
+        )
+    conn.commit()
 
 
 def valider_ep_bon_commande(conn, bon_id):

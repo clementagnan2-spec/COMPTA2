@@ -3856,6 +3856,109 @@ class RemoteExpressionBesoinTab(ttk.Frame):
                 e["id"], e["numero"], core.to_display_date(e["date_demande"]), e["demandeur"] or "", e["statut"]))
 
 
+class RemoteBonCommandeEcheancierDialog(tk.Toplevel):
+    """Planifie l'échéancier de paiement PRÉVU d'un Bon de commande via le
+    réseau — équivalent réseau complet de BonCommandeEcheancierDialog
+    (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection, bon_id, net_a_payer, on_saved):
+        super().__init__(parent)
+        self.remote = remote
+        self.bon_id = bon_id
+        self.net_a_payer = net_a_payer
+        self.on_saved = on_saved
+        self.title("Échéancier de paiement prévu")
+        self.geometry("560x420")
+        self.transient(parent)
+        self.grab_set()
+
+        ttk.Label(self, text=(
+            f"Net à payer : {fmt_cfa(net_a_payer)} F CFA — répartissez ce montant sur une ou plusieurs "
+            f"échéances prévues (purement planifié, rien n'est encore comptabilisé)."
+        ), wraplength=520, foreground="#595959").pack(anchor="w", padx=10, pady=(10, 6))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=10)
+        ttk.Label(form, text="Échéance (JJ/MM/AAAA) :").grid(row=0, column=0, sticky="w", padx=4)
+        self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(form, textvariable=self.date_var, width=12).grid(row=0, column=1, padx=4)
+        ttk.Label(form, text="Montant :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.montant_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.montant_var, width=14).grid(row=0, column=3, padx=4)
+        ttk.Button(form, text="Ajouter la tranche", command=self.ajouter_tranche).grid(row=0, column=4, padx=12)
+
+        self.tree = ttk.Treeview(self, columns=("date", "montant"), show="headings", height=8)
+        self.tree.heading("date", text="Échéance")
+        self.tree.heading("montant", text="Montant")
+        self.tree.column("date", width=140, anchor="w")
+        self.tree.column("montant", width=160, anchor="e")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Button(self, text="Retirer la tranche sélectionnée", command=self.retirer_tranche).pack(
+            anchor="w", padx=10)
+
+        self.total_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.total_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=10, pady=6)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Enregistrer l'échéancier", command=self.enregistrer).pack(side="left")
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="left", padx=8)
+
+        self.tranches = []
+        existantes = appeler(self, remote, "list_echeances_bon_commande", bon_id)
+        if existantes is not APPEL_ECHEC:
+            self.tranches = [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in existantes]
+        self._refresh_tree()
+
+    def _refresh_tree(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        total = 0.0
+        for t in self.tranches:
+            self.tree.insert("", "end", values=(core.to_display_date(t["date_echeance"]), fmt_cfa(t["montant"])))
+            total += t["montant"]
+        ecart = total - self.net_a_payer
+        etat = "✓ correspond au net à payer" if abs(ecart) < 1 else f"⚠ écart de {fmt_cfa(ecart)}"
+        self.total_var.set(f"Total des tranches : {fmt_cfa(total)} F CFA — {etat}")
+
+    def ajouter_tranche(self):
+        date_str = core.to_iso_date(self.date_var.get().strip())
+        if not date_str:
+            messagebox.showwarning("Champ manquant", "Date d'échéance invalide.", parent=self)
+            return
+        try:
+            montant = float(self.montant_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Le montant doit être un nombre.", parent=self)
+            return
+        if montant <= 0:
+            messagebox.showerror("Erreur", "Le montant doit être strictement positif.", parent=self)
+            return
+        self.tranches.append({"date_echeance": date_str, "montant": montant})
+        self.montant_var.set("")
+        self._refresh_tree()
+
+    def retirer_tranche(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        del self.tranches[idx]
+        self._refresh_tree()
+
+    def enregistrer(self):
+        if not self.tranches:
+            messagebox.showwarning("Vide", "Ajoutez au moins une tranche.", parent=self)
+            return
+        if appeler(self, self.remote, "set_echeancier_bon_commande", self.bon_id,
+                   self.tranches) is APPEL_ECHEC:
+            return
+        messagebox.showinfo("Enregistré", "Échéancier planifié sur le serveur.", parent=self)
+        self.on_saved()
+        self.destroy()
+
+
 class RemoteBonCommandeTab(ttk.Frame):
     """Bon de commande (ENGAGEMENTS-PROJETS) via le réseau — la validation
     comptabilise directement l'achat, comme sur l'application de bureau."""
@@ -3899,6 +4002,8 @@ class RemoteBonCommandeTab(ttk.Frame):
 
         ttk.Button(self, text="Valider (comptabilise + crée le Bordereau sur le serveur)",
                    command=self.valider).pack(anchor="w", padx=16, pady=8)
+        ttk.Button(self, text="Planifier un échéancier (plusieurs tranches, optionnel)",
+                   command=self.modifier_echeancier).pack(anchor="w", padx=16, pady=(0, 8))
 
         ttk.Separator(self).pack(fill="x", padx=16, pady=4)
         ttk.Label(self, text="Bons de commande existants", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16)
@@ -3948,6 +4053,21 @@ class RemoteBonCommandeTab(ttk.Frame):
         if r is APPEL_ECHEC:
             return
         self.compte_var.set(""); self.libelle_var.set(""); self.quantite_var.set("1"); self.prix_var.set("")
+        messagebox.showinfo("Ajoutée", "Ligne ajoutée.", parent=self)
+
+    def modifier_echeancier(self):
+        if not self.bon_id_selectionne:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un bon dans la liste.", parent=self)
+            return
+        totals = self._appeler("compute_ep_bon_commande_totals", self.bon_id_selectionne)
+        if totals is APPEL_ECHEC:
+            return
+        if totals["net_a_payer"] <= 0:
+            messagebox.showinfo("Info", "Ajoutez d'abord des lignes avec un montant avant de planifier "
+                                         "un échéancier.", parent=self)
+            return
+        RemoteBonCommandeEcheancierDialog(self, self.remote, self.bon_id_selectionne, totals["net_a_payer"],
+                                           lambda: None)
         messagebox.showinfo("Ajoutée", "Ligne ajoutée.", parent=self)
 
     def valider(self):

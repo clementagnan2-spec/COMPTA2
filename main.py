@@ -7578,6 +7578,109 @@ class ExpressionBesoinTab(ttk.Frame):
             self._by_iid[iid] = exp["id"]
 
 
+class BonCommandeEcheancierDialog(tk.Toplevel):
+    """Planifie l'échéancier de paiement PRÉVU d'un Bon de commande — une
+    ou plusieurs tranches, avant même la génération de la facture. Sera
+    automatiquement reprise sur le Règlement une fois la facture validée."""
+
+    def __init__(self, parent, conn, bon_id, net_a_payer, on_saved):
+        super().__init__(parent)
+        self.conn = conn
+        self.bon_id = bon_id
+        self.net_a_payer = net_a_payer
+        self.on_saved = on_saved
+        self.title("Échéancier de paiement prévu")
+        self.geometry("560x420")
+        self.transient(parent)
+        self.grab_set()
+
+        ttk.Label(self, text=(
+            f"Net à payer : {fmt_cfa(net_a_payer)} F CFA — répartissez ce montant sur une ou plusieurs "
+            f"échéances prévues (purement planifié, rien n'est encore comptabilisé)."
+        ), wraplength=520, foreground="#595959").pack(anchor="w", padx=10, pady=(10, 6))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=10)
+        ttk.Label(form, text="Échéance (JJ/MM/AAAA) :").grid(row=0, column=0, sticky="w", padx=4)
+        self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(form, textvariable=self.date_var, width=12).grid(row=0, column=1, padx=4)
+        ttk.Label(form, text="Montant :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.montant_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.montant_var, width=14).grid(row=0, column=3, padx=4)
+        ttk.Button(form, text="Ajouter la tranche", command=self.ajouter_tranche).grid(row=0, column=4, padx=12)
+
+        self.tree = ttk.Treeview(self, columns=("date", "montant"), show="headings", height=8)
+        self.tree.heading("date", text="Échéance")
+        self.tree.heading("montant", text="Montant")
+        self.tree.column("date", width=140, anchor="w")
+        self.tree.column("montant", width=160, anchor="e")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Button(self, text="Retirer la tranche sélectionnée", command=self.retirer_tranche).pack(
+            anchor="w", padx=10)
+
+        self.total_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.total_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=10, pady=6)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Enregistrer l'échéancier", command=self.enregistrer).pack(side="left")
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="left", padx=8)
+
+        self.tranches = [{"date_echeance": t["date_echeance"], "montant": t["montant"]}
+                          for t in core.list_echeances_bon_commande(conn, bon_id)]
+        self._refresh_tree()
+
+    def _refresh_tree(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        total = 0.0
+        for t in self.tranches:
+            self.tree.insert("", "end", values=(core.to_display_date(t["date_echeance"]), fmt_cfa(t["montant"])))
+            total += t["montant"]
+        ecart = total - self.net_a_payer
+        etat = "✓ correspond au net à payer" if abs(ecart) < 1 else f"⚠ écart de {fmt_cfa(ecart)}"
+        self.total_var.set(f"Total des tranches : {fmt_cfa(total)} F CFA — {etat}")
+
+    def ajouter_tranche(self):
+        date_str = core.to_iso_date(self.date_var.get().strip())
+        if not date_str:
+            messagebox.showwarning("Champ manquant", "Date d'échéance invalide.", parent=self)
+            return
+        try:
+            montant = float(self.montant_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Le montant doit être un nombre.", parent=self)
+            return
+        if montant <= 0:
+            messagebox.showerror("Erreur", "Le montant doit être strictement positif.", parent=self)
+            return
+        self.tranches.append({"date_echeance": date_str, "montant": montant})
+        self.montant_var.set("")
+        self._refresh_tree()
+
+    def retirer_tranche(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        del self.tranches[idx]
+        self._refresh_tree()
+
+    def enregistrer(self):
+        if not self.tranches:
+            messagebox.showwarning("Vide", "Ajoutez au moins une tranche.", parent=self)
+            return
+        try:
+            core.set_echeancier_bon_commande(self.conn, self.bon_id, self.tranches)
+        except ValueError as exc:
+            messagebox.showerror("Erreur", str(exc), parent=self)
+            return
+        messagebox.showinfo("Enregistré", "Échéancier planifié.", parent=self)
+        self.on_saved()
+        self.destroy()
+
+
 class BonCommandeEPDialog(tk.Toplevel):
     """Détail d'un Bon de commande (double-clic depuis la liste). La
     validation COMPTABILISE DIRECTEMENT l'achat (chaque ligne doit avoir un
@@ -7625,20 +7728,29 @@ class BonCommandeEPDialog(tk.Toplevel):
         self.date_paiement_var = tk.StringVar(value=core.to_display_date(bon.get("date_paiement_attendu") or ""))
         ttk.Entry(header, textvariable=self.date_paiement_var, width=12).grid(row=1, column=5, padx=4, pady=(6, 0), sticky="w")
 
-        ttk.Label(header, text="Retenue % :").grid(row=2, column=0, sticky="w", padx=4, pady=(6, 0))
+        echeancier_frame = ttk.Frame(header)
+        echeancier_frame.grid(row=2, column=0, columnspan=6, sticky="we", padx=4, pady=(6, 0))
+        ttk.Button(echeancier_frame, text="Planifier un échéancier (plusieurs tranches, optionnel)",
+                   command=self.modifier_echeancier).pack(side="left")
+        self.echeancier_apercu_var = tk.StringVar()
+        ttk.Label(echeancier_frame, textvariable=self.echeancier_apercu_var, foreground="#595959").pack(
+            side="left", padx=12)
+        self._refresh_echeancier_apercu()
+
+        ttk.Label(header, text="Retenue % :").grid(row=3, column=0, sticky="w", padx=4, pady=(6, 0))
         self.retenue_taux_var = tk.StringVar(value=str(bon.get("retenue_taux") or 0))
-        ttk.Entry(header, textvariable=self.retenue_taux_var, width=8).grid(row=2, column=1, padx=4, pady=(6, 0), sticky="w")
-        ttk.Label(header, text="Compte retenue :").grid(row=2, column=2, sticky="w", padx=(12, 4), pady=(6, 0))
+        ttk.Entry(header, textvariable=self.retenue_taux_var, width=8).grid(row=3, column=1, padx=4, pady=(6, 0), sticky="w")
+        ttk.Label(header, text="Compte retenue :").grid(row=3, column=2, sticky="w", padx=(12, 4), pady=(6, 0))
         self.retenue_compte_var = tk.StringVar(value=bon.get("retenue_compte") or "447800")
         self.retenue_compte_combo = ttk.Combobox(header, textvariable=self.retenue_compte_var, width=18)
-        self.retenue_compte_combo.grid(row=2, column=3, padx=4, pady=(6, 0), sticky="w")
+        self.retenue_compte_combo.grid(row=3, column=3, padx=4, pady=(6, 0), sticky="w")
         self.retenue_compte_combo.bind("<KeyRelease>", self._on_retenue_compte_keyrelease)
         self.retenue_compte_combo.bind("<Button-1>", self._open_dropdown)
         self._refresh_retenue_compte_values()
-        ttk.Label(header, text="Préréglage :").grid(row=2, column=4, sticky="w", padx=(12, 4), pady=(6, 0))
+        ttk.Label(header, text="Préréglage :").grid(row=3, column=4, sticky="w", padx=(12, 4), pady=(6, 0))
         self.retenue_preset_var = tk.StringVar()
         self.retenue_preset_combo = ttk.Combobox(header, textvariable=self.retenue_preset_var, width=20, state="readonly")
-        self.retenue_preset_combo.grid(row=2, column=5, padx=4, pady=(6, 0))
+        self.retenue_preset_combo.grid(row=3, column=5, padx=4, pady=(6, 0))
         self.retenue_preset_combo.bind("<<ComboboxSelected>>", self._on_retenue_preset_selected)
         self.retenue_preset_combo.bind("<Button-1>", self._open_dropdown)
         self._refresh_retenue_presets()
@@ -7647,10 +7759,10 @@ class BonCommandeEPDialog(tk.Toplevel):
         self.statut_var = tk.StringVar(
             value=f"Statut : {'VALIDÉ (comptabilisé + bordereau créé)' if self.validee else 'Brouillon'}   {origine}")
         ttk.Label(header, textvariable=self.statut_var, font=("Segoe UI", 10, "bold")).grid(
-            row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
+            row=4, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
         self.retard_var = tk.StringVar()
         self.retard_label = ttk.Label(header, textvariable=self.retard_var, font=("Segoe UI", 10, "bold"))
-        self.retard_label.grid(row=3, column=4, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+        self.retard_label.grid(row=4, column=4, columnspan=2, sticky="w", padx=4, pady=(4, 0))
         self._refresh_retard()
 
         lignes_frame = ttk.LabelFrame(self, text=(
@@ -7869,6 +7981,24 @@ class BonCommandeEPDialog(tk.Toplevel):
             return
         self.retard_var.set(f"Paiement : {match['statut_paiement']}")
         self.retard_label.configure(foreground="#B00020" if match["depassement_paiement"] else "#1F7A1F")
+
+    def _refresh_echeancier_apercu(self):
+        tranches = core.list_echeances_bon_commande(self.conn, self.bon_id)
+        if not tranches:
+            self.echeancier_apercu_var.set("Aucun échéancier planifié (paiement en une fois à la date ci-dessus).")
+        else:
+            self.echeancier_apercu_var.set(
+                f"{len(tranches)} tranche(s) planifiée(s) : " +
+                ", ".join(f"{core.to_display_date(t['date_echeance'])} ({fmt_cfa(t['montant'])})" for t in tranches))
+
+    def modifier_echeancier(self):
+        totals = core.compute_ep_bon_commande_totals(self.conn, self.bon_id)
+        if totals["net_a_payer"] <= 0:
+            messagebox.showinfo("Info", "Ajoutez d'abord des lignes avec un montant avant de planifier "
+                                         "un échéancier.", parent=self)
+            return
+        BonCommandeEcheancierDialog(self, self.conn, self.bon_id, totals["net_a_payer"],
+                                     self._refresh_echeancier_apercu)
 
     def save(self):
         date_str = core.to_iso_date(self.date_var.get().strip())
