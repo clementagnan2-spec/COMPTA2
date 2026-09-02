@@ -3460,32 +3460,51 @@ class RemoteStocksTab(ttk.Frame):
 
 
 class RemoteTresorerieTab(ttk.Frame):
-    """Trésorerie en lecture seule via le réseau — banques horizontales
-    et engagements à payer."""
+    """Trésorerie via le réseau — 3 onglets, comme le bureau : Banques
+    (Entrées/Sorties), Engagements à payer, Échéances (prévisionnel)."""
 
     def __init__(self, parent, remote: RemoteConnection):
         super().__init__(parent)
         self.remote = remote
         ttk.Label(self, text="TRÉSORERIE", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
-        ttk.Button(self, text="Actualiser", command=self.refresh).pack(anchor="w", padx=16, pady=(0, 4))
 
-        ttk.Label(self, text="Banques (Entrées / Sorties)", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=16, pady=(8, 2))
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=16, pady=8)
+        tab_banques = ttk.Frame(notebook)
+        tab_engagements = ttk.Frame(notebook)
+        tab_echeances = ttk.Frame(notebook)
+        notebook.add(tab_banques, text="Banques (Entrées / Sorties)")
+        notebook.add(tab_engagements, text="Engagements à payer")
+        notebook.add(tab_echeances, text="Échéances (prévisionnel)")
+
+        self._build_banques(tab_banques)
+        self._build_engagements(tab_engagements)
+        self._build_echeances(tab_echeances)
+        self.refresh()
+
+    def _build_banques(self, parent):
+        ttk.Button(parent, text="Actualiser", command=self.refresh).pack(anchor="w", padx=8, pady=(8, 4))
         cols1 = ("compte", "libelle", "debut", "entrees", "sorties", "fin")
-        self.tree_banques = ttk.Treeview(self, columns=cols1, show="headings", height=8)
+        self.tree_banques = ttk.Treeview(parent, columns=cols1, show="headings", height=14)
         for c, h, w in zip(cols1, ["Compte", "Libellé", "Solde début", "Entrées", "Sorties", "Solde fin"],
                            [90, 220, 130, 130, 130, 140]):
             self.tree_banques.heading(c, text=h)
             self.tree_banques.column(c, width=w, anchor="w" if c in ("compte", "libelle") else "e")
-        self.tree_banques.pack(fill="x", padx=16, pady=(0, 8))
+        self.tree_banques.tag_configure("total", background="#1F4E78", foreground="white",
+                                         font=("Segoe UI", 9, "bold"))
+        self.tree_banques.pack(fill="both", expand=True, padx=8, pady=8)
 
+    def _build_engagements(self, parent):
+        ttk.Label(parent, text=(
+            "Règlements déjà validés (charge comptabilisée) dont le paiement bancaire n'a pas encore été "
+            "enregistré — ce que l'entreprise doit encore décaisser, comparé à la trésorerie disponible."
+        ), foreground="#595959", wraplength=1050).pack(anchor="w", padx=8, pady=(8, 8))
+        ttk.Button(parent, text="Actualiser", command=self.refresh).pack(anchor="w", padx=8)
         self.synthese_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.synthese_var, font=("Segoe UI", 10, "bold"), wraplength=1200).pack(
-            anchor="w", padx=16, pady=(4, 4))
-        ttk.Label(self, text="Engagements à payer (règlements validés, non encore payés)",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(8, 2))
+        ttk.Label(parent, textvariable=self.synthese_var, font=("Segoe UI", 10, "bold"), wraplength=1200).pack(
+            anchor="w", padx=8, pady=(8, 8))
         cols2 = ("numero", "date", "fournisseur", "montant", "statut")
-        self.tree_engagements = ttk.Treeview(self, columns=cols2, show="headings", height=10)
+        self.tree_engagements = ttk.Treeview(parent, columns=cols2, show="headings", height=14)
         for c, h, w in zip(cols2, ["N° Règlement", "Date", "Fournisseur", "Montant restant à payer", "Statut"],
                            [130, 100, 220, 170, 220]):
             self.tree_engagements.heading(c, text=h)
@@ -3493,29 +3512,30 @@ class RemoteTresorerieTab(ttk.Frame):
         self.tree_engagements.tag_configure("total", background="#1F4E78", foreground="white",
                                              font=("Segoe UI", 9, "bold"))
         self.tree_engagements.tag_configure("retard", foreground="#B00020")
-        self.tree_engagements.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self.tree_engagements.pack(fill="both", expand=True, padx=8, pady=8)
 
-        ttk.Label(self, text=(
-            "Échéances (prévisionnel) — bons de commande (même pas encore facturés) et factures "
-            "fournisseurs/clients à venir, par mois, avec le(s) compte(s) de charge concerné(s)"
-        ), font=("Segoe UI", 10, "bold"), wraplength=1100).pack(anchor="w", padx=16, pady=(8, 2))
-        ech_top = ttk.Frame(self)
-        ech_top.pack(fill="x", padx=16)
+    def _build_echeances(self, parent):
+        ttk.Label(parent, text=(
+            "Tous les engagements fournisseurs (bons de commande — même pas encore facturés — et "
+            "factures validées) et clients ayant une échéance de paiement pas encore réglée, répartis "
+            "par mois avec le(s) compte(s) de charge concerné(s)."
+        ), foreground="#595959", wraplength=1050).pack(anchor="w", padx=8, pady=(8, 8))
+        ech_top = ttk.Frame(parent)
+        ech_top.pack(fill="x", padx=8)
         ttk.Label(ech_top, text="À partir du (JJ/MM/AAAA) :").pack(side="left")
         self.echeance_date_from_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
         ttk.Entry(ech_top, textvariable=self.echeance_date_from_var, width=12).pack(side="left", padx=4)
         ttk.Label(ech_top, text="Nombre de mois :").pack(side="left", padx=(12, 4))
         self.echeance_nb_mois_var = tk.StringVar(value="6")
         ttk.Entry(ech_top, textvariable=self.echeance_nb_mois_var, width=4).pack(side="left")
-        ttk.Button(ech_top, text="Actualiser les échéances", command=self.refresh).pack(side="left", padx=8)
+        ttk.Button(ech_top, text="Actualiser", command=self.refresh).pack(side="left", padx=8)
         self.echeances_synthese_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.echeances_synthese_var, font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=16, pady=(4, 4))
-        self.tree_echeances = ttk.Treeview(self, show="headings", height=10)
+        ttk.Label(parent, textvariable=self.echeances_synthese_var, font=("Segoe UI", 11, "bold")).pack(
+            anchor="w", padx=8, pady=8)
+        self.tree_echeances = ttk.Treeview(parent, show="headings", height=14)
         self.tree_echeances.tag_configure("total", background="#1F4E78", foreground="white",
                                            font=("Segoe UI", 10, "bold"))
-        self.tree_echeances.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self.refresh()
+        self.tree_echeances.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _appeler(self, fonction, *args, **kwargs):
         return appeler(self, self.remote, fonction, *args, **kwargs)
@@ -3531,7 +3551,7 @@ class RemoteTresorerieTab(ttk.Frame):
             self.tree_banques.insert("", "end", values=(
                 l["code"], l["label"], fmt_cfa(l["solde_debut_periode"]), fmt_cfa(l["debit_periode"]),
                 fmt_cfa(l["credit_periode"]), fmt_cfa(l["solde_fin_periode"])))
-        self.tree_banques.insert("", "end", values=(
+        self.tree_banques.insert("", "end", tags=("total",), values=(
             "TOTAL", "", fmt_cfa(total["solde_debut_periode"]), fmt_cfa(total["debit_periode"]),
             fmt_cfa(total["credit_periode"]), fmt_cfa(total["solde_fin_periode"])))
 
