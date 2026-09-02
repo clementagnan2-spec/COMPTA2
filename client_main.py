@@ -6310,7 +6310,20 @@ class RemoteRecetteFabricationTab(ttk.Frame):
         self.remote = remote
         self.selected_produit = None
 
-        top = ttk.Frame(self)
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        scrollable = ttk.Frame(canvas)
+        scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=scrollable, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(canvas_window, width=e.width))
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>", lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        top = ttk.Frame(scrollable)
         top.pack(fill="x", padx=12, pady=8)
         ttk.Label(top, text="Produit fini :").pack(side="left")
         self.produit_var = tk.StringVar()
@@ -6320,7 +6333,7 @@ class RemoteRecetteFabricationTab(ttk.Frame):
         ttk.Button(top, text="Nouveau produit fini", command=self._new_produit).pack(side="left", padx=8)
         ttk.Button(top, text="Supprimer ce produit", command=self._delete_produit).pack(side="left", padx=2)
 
-        params = ttk.Frame(self)
+        params = ttk.Frame(scrollable)
         params.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Label(params, text="Quantité produite par recette :").pack(side="left")
         self.qte_produite_var = tk.StringVar()
@@ -6336,7 +6349,7 @@ class RemoteRecetteFabricationTab(ttk.Frame):
         self._refresh_compte_pf_values()
         ttk.Button(params, text="Enregistrer ces paramètres", command=self._save_params).pack(side="left", padx=8)
 
-        form = ttk.LabelFrame(self, text="Ajouter un composant à la recette")
+        form = ttk.LabelFrame(scrollable, text="Ajouter un composant à la recette")
         form.pack(fill="x", padx=12, pady=4)
         ttk.Label(form, text="Type :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.type_var = tk.StringVar(value="matiere")
@@ -6393,7 +6406,7 @@ class RemoteRecetteFabricationTab(ttk.Frame):
         ttk.Button(form, text="Ajouter le composant", command=self.add_ligne).grid(row=4, column=5, padx=4, pady=4)
 
         cols = ("id", "type", "libelle", "compte", "quantite", "cout_unitaire", "analytique", "source", "montant")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=8)
+        self.tree = ttk.Treeview(scrollable, columns=cols, show="headings", height=8)
         headers = ["ID", "Type", "Libellé", "Compte", "Quantité", "Coût unitaire", "Code analytique",
                    "Origine du coût", "Montant"]
         widths = [40, 90, 180, 90, 80, 110, 130, 170, 110]
@@ -6401,13 +6414,13 @@ class RemoteRecetteFabricationTab(ttk.Frame):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", padx=12, pady=8)
-        ttk.Button(self, text="Supprimer le composant sélectionné", command=self.delete_ligne).pack(
+        ttk.Button(scrollable, text="Supprimer le composant sélectionné", command=self.delete_ligne).pack(
             anchor="w", padx=12)
 
-        self.result_text = tk.Text(self, font=("Consolas", 11), height=8, wrap="none")
+        self.result_text = tk.Text(scrollable, font=("Consolas", 11), height=8, wrap="none")
         self.result_text.pack(fill="x", padx=12, pady=8)
 
-        ttk.Button(self, text="Valider la fabrication (comptabiliser)", command=self.valider_fabrication).pack(
+        ttk.Button(scrollable, text="Valider la fabrication (comptabiliser)", command=self.valider_fabrication).pack(
             anchor="w", padx=12, pady=(0, 8))
 
         self._on_type_changed()
