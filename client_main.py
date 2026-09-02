@@ -199,6 +199,7 @@ class ClientApp(tk.Tk):
         "facturation": lambda parent, remote: RemoteFacturationTab(parent, remote),
         "stocks": lambda parent, remote: RemoteStocksTab(parent, remote),
         "tresorerie": lambda parent, remote: RemoteTresorerieTab(parent, remote),
+        "rapprochement_bancaire": lambda parent, remote: RemoteRapprochementBancaireTab(parent, remote),
         "immobilisations": lambda parent, remote: RemoteImmobilisationsTab(parent, remote),
         "expression_besoin": lambda parent, remote: RemoteExpressionBesoinTab(parent, remote),
         "ep_bon_commande": lambda parent, remote: RemoteBonCommandeTab(parent, remote),
@@ -3594,6 +3595,53 @@ class RemoteStocksTab(ttk.Frame):
     def refresh(self):
         self.synthese_tab.refresh()
         self.mouvements_tab.refresh()
+
+
+class RemoteRapprochementBancaireTab(ttk.Frame):
+    """Rapprochement bancaire via le réseau (menu TRESORERIE) —
+    équivalent réseau complet de RapprochementBancaireTab (bureau) :
+    liste des comptes de banque, clic pour ouvrir le rapprochement
+    détaillé de ce compte."""
+
+    def __init__(self, parent, remote: RemoteConnection):
+        super().__init__(parent)
+        self.remote = remote
+        ttk.Label(self, text="RAPPROCHEMENT BANCAIRE", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(self, text=(
+            "Tous les comptes de banque (52xxxx) avec leur solde comptable actuel. Cliquez sur une "
+            "ligne pour pointer ses mouvements par rapport au relevé bancaire papier."
+        ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
+        ttk.Button(self, text="Actualiser", command=self.refresh).pack(anchor="w", padx=16, pady=(0, 8))
+
+        cols = ("compte", "libelle", "solde")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=20)
+        for c, h, w in zip(cols, ["Compte", "Libellé", "Solde comptable"], [100, 400, 180]):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w" if c != "solde" else "e")
+        self.tree.pack(fill="both", expand=True, padx=16, pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.refresh()
+
+    def _appeler(self, fonction, *args, **kwargs):
+        return appeler(self, self.remote, fonction, *args, **kwargs)
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        v = self.tree.item(sel[0], "values")
+        compte, libelle = v[0], v[1]
+        RemoteRapprochementCompteDialog(self, self.remote, compte, libelle, on_saved=self.refresh)
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        comptes = self._appeler("compute_comptes_prefixe_periode", "52")
+        if comptes is APPEL_ECHEC:
+            return
+        for c in comptes:
+            self.tree.insert("", "end", values=(c["code"], c["label"], fmt_cfa(c["solde_fin_periode"])))
 
 
 class RemoteTresorerieTab(ttk.Frame):

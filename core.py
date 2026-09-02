@@ -8785,7 +8785,7 @@ MENU_STRUCTURE = [
     ("GRH", [("Liste du personnel", "grh_personnel"), ("Time sheet", "grh_time_sheet"), ("KPI", "grh_kpi"),
              ("Tableau de bord GRH", "grh_tableau_bord"), ("HS (hygiène santé)", "grh_hs"),
              ("Paie", "grh_paie")]),
-    ("TRESORERIE", [("Trésorerie", "tresorerie")]),
+    ("TRESORERIE", [("Trésorerie", "tresorerie"), ("Rapprochement bancaire", "rapprochement_bancaire")]),
     ("TRANSPORT", [("Parc auto", "transport"), ("Missions", "missions"),
                     ("Pièces de rechange", "pieces_rechange"), ("Réparations", "reparations")]),
     ("IMMOBILISATIONS", [("Immobilisations", "immobilisations"), ("Amortissements", "amortissements")]),
@@ -8840,7 +8840,7 @@ def ajouter_niveaux_acces_suggeres_menus(conn):
     charge_achats_menus = ["fournisseurs", "contrats", "expression_besoin", "ep_bon_commande",
                             "factures_frs", "bordereau_livraison", "reglements"]
     grh_menus = ["grh_personnel", "grh_time_sheet", "grh_kpi", "grh_tableau_bord", "grh_hs", "grh_paie"]
-    tresorier_menus = ["tresorerie", "recouvrement", "reglements"]
+    tresorier_menus = ["tresorerie", "rapprochement_bancaire", "recouvrement", "reglements"]
     usine_menus = ["stocks", "production", "transport", "missions", "pieces_rechange", "reparations",
                    "immobilisations", "amortissements", "energie", "maintenance", "rapports_technique"]
 

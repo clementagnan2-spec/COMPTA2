@@ -215,6 +215,7 @@ class App(tk.Tk):
         register("grh_hs", HsTab)
         register("grh_paie", PaieTab)
         register("tresorerie", TresorerieTab)
+        register("rapprochement_bancaire", RapprochementBancaireTab)
         register("transport", ParcAutoTab)
         register("missions", MissionsTab)
         register("pieces_rechange", PiecesRechangeTab)
@@ -308,6 +309,7 @@ class App(tk.Tk):
         ])
         add_top_menu("TRESORERIE", [
             ("Trésorerie", "tresorerie"),
+            ("Rapprochement bancaire", "rapprochement_bancaire"),
         ])
         add_top_menu("TRANSPORT", [
             ("Parc auto", "transport"),
@@ -5766,103 +5768,47 @@ class RapprochementCompteDialog(tk.Toplevel):
 
 
 class RapprochementBancaireTab(ttk.Frame):
-    """Rapprochement bancaire : tous les comptes de banque (racine 52,
-    détaillés compte par compte à 6 chiffres), mouvement par mouvement sur
-    la période choisie, avec une case à cocher par mouvement pour le pointer
-    comme retrouvé dans le relevé bancaire papier — le pointage est enregistré
-    et reste visible à la prochaine ouverture."""
+    """Rapprochement bancaire (menu TRESORERIE) — liste tous les comptes
+    de banque (racine 52) avec leur solde comptable actuel. Cliquez sur
+    une ligne pour ouvrir le rapprochement détaillé de ce compte
+    (mouvement par mouvement, case à cocher, comparaison au solde du
+    relevé bancaire papier) — voir RapprochementCompteDialog."""
 
     def __init__(self, parent, conn):
         super().__init__(parent)
         self.conn = conn
-        self._row_entry_ids = {}
-        ttk.Label(self, text="RAPPROCHEMENT BANCAIRE", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(self, text="RAPPROCHEMENT BANCAIRE", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4))
         ttk.Label(self, text=(
-            "Tous les comptes de banque (52xxxx), détaillés compte par compte, avec chaque mouvement de la "
-            "période choisie. Cliquez sur la colonne « Pointé » pour cocher/décocher un mouvement retrouvé "
-            "dans le relevé bancaire papier — le pointage est mémorisé."
+            "Tous les comptes de banque (52xxxx) avec leur solde comptable actuel. Cliquez sur une "
+            "ligne pour pointer ses mouvements par rapport au relevé bancaire papier."
         ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
+        ttk.Button(self, text="Actualiser", command=self.refresh).pack(anchor="w", padx=16, pady=(0, 8))
 
-        filt = ttk.Frame(self)
-        filt.pack(fill="x", padx=16, pady=4)
-        ttk.Label(filt, text="Du (JJ/MM/AAAA) :").pack(side="left")
-        self.date_from_var = tk.StringVar()
-        ttk.Entry(filt, textvariable=self.date_from_var, width=12).pack(side="left", padx=4)
-        ttk.Label(filt, text="Au (JJ/MM/AAAA) :").pack(side="left", padx=(12, 0))
-        self.date_to_var = tk.StringVar()
-        ttk.Entry(filt, textvariable=self.date_to_var, width=12).pack(side="left", padx=4)
-        ttk.Button(filt, text="Afficher", command=self.refresh).pack(side="left", padx=8)
-        ttk.Button(filt, text="Exercice entier", command=self._reset_filter).pack(side="left", padx=2)
-
-        cols = ("pointe", "date", "piece", "libelle", "debit", "credit", "solde")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=24)
-        headers = ["Pointé", "Date", "Pièce", "Libellé", "Débit", "Crédit", "Solde cumulé"]
-        widths = [60, 85, 70, 320, 100, 100, 120]
-        for c, h, w in zip(cols, headers, widths):
+        cols = ("compte", "libelle", "solde")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=20)
+        for c, h, w in zip(cols, ["Compte", "Libellé", "Solde comptable"], [100, 400, 180]):
             self.tree.heading(c, text=h)
-            anchor = "center" if c in ("pointe", "debit", "credit", "solde") else "w"
-            self.tree.column(c, width=w, anchor=anchor)
-        self.tree.tag_configure("compte_header", background="#B4C6E7", font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("compte_footer", background="#DCE6F1", font=("Segoe UI", 9, "bold"))
-        self.tree.tag_configure("pointe", background="#D9EAD3")
-        self.tree.pack(fill="both", padx=16, pady=8)
-        self.tree.bind("<Button-1>", self._on_click)
-
-        self.ecart_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.ecart_var, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(0, 12))
+            self.tree.column(c, width=w, anchor="w" if c != "solde" else "e")
+        self.tree.pack(fill="both", expand=True, padx=16, pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.refresh()
 
-    def _reset_filter(self):
-        self.date_from_var.set("")
-        self.date_to_var.set("")
-        self.refresh()
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        v = self.tree.item(sel[0], "values")
+        compte, libelle = v[0], v[1]
+        RapprochementCompteDialog(self, self.conn, compte, libelle, on_saved=self.refresh)
 
     def refresh(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
-        self._row_entry_ids = {}
-        date_from = core.to_iso_date(self.date_from_var.get()) if self.date_from_var.get().strip() else None
-        date_to = core.to_iso_date(self.date_to_var.get()) if self.date_to_var.get().strip() else None
-        comptes = core.compute_mouvements_prefixe_periode(self.conn, "52", date_from=date_from, date_to=date_to)
-
-        total_periode = 0.0
-        total_pointe = 0.0
+        comptes = core.compute_comptes_prefixe_periode(self.conn, "52")
         for c in comptes:
-            self.tree.insert("", "end", tags=("compte_header",), values=(
-                "", "", "", f"{c['code']} {c['label']} — solde début de période : {fmt_cfa(c['solde_debut_periode'])}",
-                "", "", "",
-            ))
-            for m in c["mouvements"]:
-                iid = self.tree.insert("", "end", tags=("pointe",) if m["pointe"] else (), values=(
-                    "☑" if m["pointe"] else "☐", core.to_display_date(m["date"]), m["piece"] or "",
-                    m["libelle"] or "", f"{fmt_cfa(m['debit'])}" if m["debit"] else "",
-                    f"{fmt_cfa(m['credit'])}" if m["credit"] else "", f"{fmt_cfa(m['solde_cumule'])}",
-                ))
-                self._row_entry_ids[iid] = m["id"]
-                total_periode += m["debit"] - m["credit"]
-            self.tree.insert("", "end", tags=("compte_footer",), values=(
-                "", "", "", f"  Solde fin de période — {c['code']}", "", "", f"{fmt_cfa(c['solde_fin_periode'])}",
-            ))
-            total_pointe += c["total_pointe"]
+            self.tree.insert("", "end", values=(c["code"], c["label"], fmt_cfa(c["solde_fin_periode"])))
 
-        self.ecart_var.set(
-            f"Total pointé (retrouvé dans le relevé) : {fmt_cfa(total_pointe)}    "
-            f"Total des mouvements de la période : {fmt_cfa(total_periode)}    "
-            f"Écart non pointé : {fmt_cfa(total_periode - total_pointe)}"
-        )
-
-    def _on_click(self, event):
-        if self.tree.identify_region(event.x, event.y) != "cell":
-            return
-        if self.tree.identify_column(event.x) != "#1":
-            return
-        row = self.tree.identify_row(event.y)
-        if row not in self._row_entry_ids:
-            return
-        entry_id = self._row_entry_ids[row]
-        deja_pointe = self.tree.set(row, "pointe") == "☑"
-        core.set_pointage_bancaire(self.conn, entry_id, not deja_pointe)
-        self.refresh()
 
 
 class VentesTab(ttk.Frame):
