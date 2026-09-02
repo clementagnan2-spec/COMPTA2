@@ -1485,7 +1485,16 @@ class BalanceTab(ttk.Frame):
         self.conn = conn
         cols = ("compte", "libelle", "ouv_debit", "ouv_credit", "cumul_debit", "cumul_credit",
                 "solde_debit", "solde_credit")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings")
+        btn_bar = ttk.Frame(self)
+        btn_bar.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Button(btn_bar, text="Actualiser", command=self.refresh).pack(side="left", padx=8)
+        ttk.Button(btn_bar, text="Exporter (.xlsx)", command=self.export_xlsx).pack(side="left", padx=2)
+        self.ecart_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.ecart_var, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8, pady=(0, 4))
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         headers = ["N° Compte", "Libellé du compte", "Ouverture Débit", "Ouverture Crédit",
                    "Mouvement Débit", "Mouvement Crédit", "Clôture Débit", "Clôture Crédit"]
         widths = [90, 220, 100, 100, 100, 100, 100, 100]
@@ -1494,13 +1503,10 @@ class BalanceTab(ttk.Frame):
             self.tree.column(c, width=w, anchor="w")
         self.tree.tag_configure("classe_total", background="#DCE6F1", font=("Segoe UI", 9, "bold"))
         self.tree.tag_configure("grand_total", background="#1F4E78", foreground="white", font=("Segoe UI", 10, "bold"))
-        self.tree.pack(fill="both", padx=8, pady=8)
-        btn_bar = ttk.Frame(self)
-        btn_bar.pack(fill="x", pady=(0, 4))
-        ttk.Button(btn_bar, text="Actualiser", command=self.refresh).pack(side="left", padx=8)
-        ttk.Button(btn_bar, text="Exporter (.xlsx)", command=self.export_xlsx).pack(side="left", padx=2)
-        self.ecart_var = tk.StringVar()
-        ttk.Label(self, textvariable=self.ecart_var, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8, pady=(0, 8))
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
         self.refresh()
 
     def export_xlsx(self):

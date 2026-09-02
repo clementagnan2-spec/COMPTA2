@@ -2979,15 +2979,22 @@ class RemoteBalanceTab(ttk.Frame):
         self.remote = remote
         ttk.Label(self, text="BALANCE", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
         ttk.Button(self, text="Actualiser", command=self.refresh).pack(anchor="w", padx=16, pady=(0, 4))
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         cols = ("compte", "libelle", "ouv_debit", "ouv_credit", "mvt_debit", "mvt_credit", "sold_debit", "sold_credit")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=30)
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         headers = ["N° Compte", "Libellé", "Ouv. Débit", "Ouv. Crédit", "Mvt Débit", "Mvt Crédit",
                    "Clôt. Débit", "Clôt. Crédit"]
         widths = [90, 220, 100, 100, 100, 100, 100, 100]
         for c, h, w in zip(cols, headers, widths):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w" if c in ("compte", "libelle") else "e")
-        self.tree.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.tree.tag_configure("classe_total", background="#DCE6F1", font=("Segoe UI", 9, "bold"))
+        self.tree.tag_configure("grand_total", background="#1F4E78", foreground="white", font=("Segoe UI", 10, "bold"))
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
         self.refresh()
 
     def _appeler(self, fonction, *args, **kwargs):
@@ -3006,12 +3013,12 @@ class RemoteBalanceTab(ttk.Frame):
                     fmt_cfa(l["cumul_debit"]), fmt_cfa(l["cumul_credit"]), fmt_cfa(l["solde_debit"]),
                     fmt_cfa(l["solde_credit"])))
             st = c["sous_total"]
-            self.tree.insert("", "end", values=(
+            self.tree.insert("", "end", tags=("classe_total",), values=(
                 "", f"TOTAL CLASSE {c['classe']}", fmt_cfa(st["ouverture_debit"]), fmt_cfa(st["ouverture_credit"]),
                 fmt_cfa(st["cumul_debit"]), fmt_cfa(st["cumul_credit"]), fmt_cfa(st["solde_debit"]),
                 fmt_cfa(st["solde_credit"])))
         gt = d["grand_total"]
-        self.tree.insert("", "end", values=(
+        self.tree.insert("", "end", tags=("grand_total",), values=(
             "", "TOTAL BALANCE", fmt_cfa(gt["ouverture_debit"]), fmt_cfa(gt["ouverture_credit"]),
             fmt_cfa(gt["cumul_debit"]), fmt_cfa(gt["cumul_credit"]), fmt_cfa(gt["solde_debit"]),
             fmt_cfa(gt["solde_credit"])))
