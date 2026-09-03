@@ -3875,6 +3875,8 @@ class RemoteFacturationTab(ttk.Frame):
         self.client_combo.bind("<KeyRelease>", self._on_client_keyrelease)
         self._refresh_client_values()
         ttk.Button(header, text="Créer la facture", command=self.creer).grid(row=0, column=6, padx=12)
+        ttk.Button(header, text="✓ Valider et envoyer en Saisie", command=self.valider).grid(
+            row=0, column=7, padx=4)
         ttk.Label(header, text="Date de règlement prévu (JJ/MM/AAAA) :").grid(
             row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 0))
         self.date_paiement_prevu_var = tk.StringVar()

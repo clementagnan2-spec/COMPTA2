@@ -7244,6 +7244,7 @@ class FacturationTab(ttk.Frame):
                                         command=self.corriger_facture)
         self.corriger_btn.pack(side="left", padx=2)
         ttk.Button(top, text="Aperçu avant impression", command=self.imprimer_facture).pack(side="left", padx=2)
+        ttk.Button(top, text="✓ Valider et envoyer en Saisie", command=self.valider).pack(side="left", padx=8)
         self.statut_var = tk.StringVar()
         ttk.Label(top, textvariable=self.statut_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=16)
 
