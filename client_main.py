@@ -5293,7 +5293,7 @@ class RemoteFacturesRecouvrementTab(ttk.Frame):
             self.tree.delete(row)
         for f in factures:
             tag = "depasse" if f.get("en_retard") else ("soldee" if f["statut_paiement_detail"] == "✓ Soldée" else "")
-            self.tree.insert("", "end", tags=(tag,) if tag else (), values=(
+            self.tree.insert("", "end", iid=str(f["id"]), tags=(tag,) if tag else (), values=(
                 f["id"], f["raison_sociale"], f["piece"] or "", f["libelle"] or "",
                 fmt_cfa(f["montant"]), core.to_display_date(f["date_facture"]),
                 core.to_display_date(f["date_echeance_paiement"]), f["statut_paiement_detail"],
