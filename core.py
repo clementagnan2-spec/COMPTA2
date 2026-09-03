@@ -514,7 +514,29 @@ def init_db(conn):
             tva_taux REAL NOT NULL DEFAULT 0,
             tva_compte TEXT,
             statut TEXT NOT NULL DEFAULT 'brouillon',
-            piece TEXT
+            piece TEXT,
+            date_paiement_prevu TEXT,
+            facture_client_id INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS facture_vente_echeances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            facture_id INTEGER NOT NULL,
+            numero_tranche INTEGER NOT NULL,
+            date_echeance TEXT NOT NULL,
+            montant REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS client_echeances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            facture_client_id INTEGER NOT NULL,
+            numero_tranche INTEGER NOT NULL,
+            date_echeance TEXT NOT NULL,
+            montant REAL NOT NULL,
+            date_paiement_reel TEXT,
+            compte_reglement TEXT
         )
     """)
     conn.execute("""
@@ -984,6 +1006,12 @@ def _migrate(conn):
     rep_cols = [r["name"] for r in conn.execute("PRAGMA table_info(reparations)")]
     if rep_cols and "machine_id" not in rep_cols:
         conn.execute("ALTER TABLE reparations ADD COLUMN machine_id INTEGER")
+
+    fv_cols = [r["name"] for r in conn.execute("PRAGMA table_info(factures_vente)")]
+    if fv_cols and "date_paiement_prevu" not in fv_cols:
+        conn.execute("ALTER TABLE factures_vente ADD COLUMN date_paiement_prevu TEXT")
+    if fv_cols and "facture_client_id" not in fv_cols:
+        conn.execute("ALTER TABLE factures_vente ADD COLUMN facture_client_id INTEGER")
 
     # Migre l'ancien mécanisme "stock_initial_<compte>" (settings) vers opening_balances
     default_exercice = str(datetime.today().year)
@@ -2267,26 +2295,38 @@ def add_facture(conn, client_code, piece, libelle, montant, date_facture,
     delai_paiement = client["delai_paiement_jours"] if client else 30
     base = datetime.strptime(date_facture, "%Y-%m-%d")
     date_echeance = date_echeance_override or (base + timedelta(days=delai_paiement)).strftime("%Y-%m-%d")
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO factures_clients
            (client_code, piece, libelle, montant, date_facture, date_echeance_paiement)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (client_code, piece, libelle, montant, date_facture, date_echeance),
     )
     conn.commit()
+    facture_client_id = cur.lastrowid
+    # Échéance par défaut (une seule tranche, pour le montant total) — remplaçable
+    # par un échéancier à plusieurs tranches via set_echeancier_client.
+    set_echeancier_client(conn, facture_client_id, [{"date_echeance": date_echeance, "montant": montant}])
+    return facture_client_id
 
 
 def enregistrer_paiement_facture(conn, facture_id, date_paiement_reel, compte_reglement, exercice=None):
-    """Enregistre le règlement d'une facture client (Recouvrement) ET
-    comptabilise l'encaissement : une écriture équilibrée Débit compte
-    banque/caisse choisi / Crédit compte client (411000, même convention que
-    la Facturation), pour le montant de la facture. Ne comptabilise
+    """Enregistre le règlement GLOBAL d'une facture client (Recouvrement) ET
+    comptabilise l'encaissement en une seule fois. Bloqué si la facture a un
+    échéancier à plusieurs tranches — utiliser alors
+    enregistrer_paiement_echeance_client tranche par tranche. Ne comptabilise
     qu'UNE SEULE FOIS par facture (garde-fou `reglement_comptabilise`) —
     modifier ensuite la date de paiement ne repostera pas une seconde
     écriture."""
     facture = conn.execute("SELECT * FROM factures_clients WHERE id = ?", (facture_id,)).fetchone()
     if not facture:
         raise ValueError("Facture introuvable.")
+    if facture["reglement_comptabilise"]:
+        raise ValueError("Le règlement de cette facture a déjà été comptabilisé.")
+    if len(list_echeances_client(conn, facture_id)) > 1:
+        raise ValueError(
+            "Cette facture a un échéancier à plusieurs tranches — payez chaque tranche individuellement "
+            "(voir la liste des échéances) plutôt qu'en un seul versement."
+        )
     if not compte_reglement or not account_exists(conn, compte_reglement):
         raise ValueError(f"Le compte de règlement « {compte_reglement} » n'existe pas.")
     if account_racine(compte_reglement) != "5":
@@ -2308,6 +2348,12 @@ def enregistrer_paiement_facture(conn, facture_id, date_paiement_reel, compte_re
            WHERE id = ?""",
         (date_paiement_reel, compte_reglement, facture_id),
     )
+    # Marque aussi l'unique tranche existante comme payée, pour rester cohérent
+    # avec list_echeances_client.
+    for e in list_echeances_client(conn, facture_id):
+        if not e["date_paiement_reel"]:
+            conn.execute("UPDATE client_echeances SET date_paiement_reel = ?, compte_reglement = ? WHERE id = ?",
+                         (date_paiement_reel, compte_reglement, e["id"]))
     conn.commit()
 
 
@@ -2356,6 +2402,200 @@ def list_factures(conn, client_code=None, date_from=None, date_to=None):
             r["statut_paiement"] = "En attente"
             r["depassement"] = False
     return rows
+
+
+def list_echeances_facture_vente(conn, facture_id):
+    """Échéancier de règlement PLANIFIÉ (une ou plusieurs tranches) sur
+    une Facture de vente en brouillon — purement prévisionnel, rien n'est
+    encore comptabilisé. Sera automatiquement repris sur le suivi
+    Recouvrement dès que la facture sera validée."""
+    rows = conn.execute(
+        "SELECT * FROM facture_vente_echeances WHERE facture_id = ? ORDER BY numero_tranche", (facture_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_echeancier_facture_vente(conn, facture_id, tranches):
+    """Définit (ou remplace) l'échéancier de règlement PRÉVU d'une Facture
+    de vente en brouillon — un client peut régler en plusieurs fois sur
+    plusieurs mois. `tranches` : liste de dicts {date_echeance, montant}.
+    La somme doit correspondre au TTC de la facture."""
+    facture = get_facture_vente(conn, facture_id)
+    if not facture:
+        raise ValueError("Facture introuvable.")
+    if not tranches:
+        raise ValueError("L'échéancier doit contenir au moins une tranche.")
+    totals = compute_facture_totals(conn, facture_id)
+    total_tranches = 0.0
+    lignes_validees = []
+    for i, t in enumerate(tranches, start=1):
+        date_echeance = to_iso_date(t.get("date_echeance", ""))
+        if not date_echeance:
+            raise ValueError(f"Tranche {i} : date d'échéance invalide.")
+        try:
+            montant = float(t.get("montant") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Tranche {i} : montant invalide.")
+        if montant <= 0:
+            raise ValueError(f"Tranche {i} : le montant doit être strictement positif.")
+        total_tranches += montant
+        lignes_validees.append((date_echeance, montant))
+    if abs(total_tranches - totals["total_ttc"]) > 1:
+        raise ValueError(
+            f"La somme des tranches ({total_tranches:,.0f}) doit correspondre au montant TTC "
+            f"({totals['total_ttc']:,.0f})."
+        )
+    conn.execute("DELETE FROM facture_vente_echeances WHERE facture_id = ?", (facture_id,))
+    for i, (date_echeance, montant) in enumerate(sorted(lignes_validees, key=lambda x: x[0]), start=1):
+        conn.execute(
+            "INSERT INTO facture_vente_echeances (facture_id, numero_tranche, date_echeance, montant) "
+            "VALUES (?, ?, ?, ?)",
+            (facture_id, i, date_echeance, montant),
+        )
+    conn.commit()
+
+
+def list_echeances_client(conn, facture_client_id):
+    """Échéancier de règlement (une ou plusieurs tranches) d'une facture
+    client déjà comptabilisée — chaque tranche a un statut : « Payée »,
+    « En retard » ou « À venir »."""
+    rows = conn.execute(
+        "SELECT * FROM client_echeances WHERE facture_client_id = ? ORDER BY numero_tranche", (facture_client_id,)
+    ).fetchall()
+    today = date.today().strftime("%Y-%m-%d")
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d["date_paiement_reel"]:
+            d["statut"] = "Payée"
+        elif d["date_echeance"] < today:
+            d["statut"] = "En retard"
+        else:
+            d["statut"] = "À venir"
+        result.append(d)
+    return result
+
+
+def set_echeancier_client(conn, facture_client_id, tranches):
+    """Définit (ou remplace) l'échéancier de règlement d'une facture
+    client déjà comptabilisée — impossible si des tranches sont déjà
+    payées."""
+    facture = conn.execute("SELECT * FROM factures_clients WHERE id = ?", (facture_client_id,)).fetchone()
+    if not facture:
+        raise ValueError("Facture client introuvable.")
+    if not tranches:
+        raise ValueError("L'échéancier doit contenir au moins une tranche.")
+    existantes = list_echeances_client(conn, facture_client_id)
+    if any(e["date_paiement_reel"] for e in existantes):
+        raise ValueError(
+            "Impossible de modifier l'échéancier : au moins une tranche a déjà été payée. "
+            "Annulez d'abord son paiement si vous devez la corriger."
+        )
+    total_tranches = 0.0
+    lignes_validees = []
+    for i, t in enumerate(tranches, start=1):
+        date_echeance = to_iso_date(t.get("date_echeance", ""))
+        if not date_echeance:
+            raise ValueError(f"Tranche {i} : date d'échéance invalide.")
+        try:
+            montant = float(t.get("montant") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Tranche {i} : montant invalide.")
+        if montant <= 0:
+            raise ValueError(f"Tranche {i} : le montant doit être strictement positif.")
+        total_tranches += montant
+        lignes_validees.append((date_echeance, montant))
+    if abs(total_tranches - facture["montant"]) > 1:
+        raise ValueError(
+            f"La somme des tranches ({total_tranches:,.0f}) doit correspondre au montant de la facture "
+            f"({facture['montant']:,.0f})."
+        )
+    conn.execute("DELETE FROM client_echeances WHERE facture_client_id = ?", (facture_client_id,))
+    for i, (date_echeance, montant) in enumerate(sorted(lignes_validees, key=lambda x: x[0]), start=1):
+        conn.execute(
+            "INSERT INTO client_echeances (facture_client_id, numero_tranche, date_echeance, montant) "
+            "VALUES (?, ?, ?, ?)",
+            (facture_client_id, i, date_echeance, montant),
+        )
+    conn.commit()
+
+
+def enregistrer_paiement_echeance_client(conn, echeance_id, date_paiement, compte_reglement):
+    """Enregistre le paiement d'UNE tranche de l'échéancier client
+    (comptabilise Débit banque-caisse / Crédit client 411000, pour le
+    montant de cette seule tranche)."""
+    row = conn.execute("SELECT * FROM client_echeances WHERE id = ?", (echeance_id,)).fetchone()
+    if not row:
+        raise ValueError("Échéance introuvable.")
+    echeance = dict(row)
+    if echeance["date_paiement_reel"]:
+        raise ValueError("Cette tranche est déjà payée.")
+    facture = conn.execute(
+        "SELECT * FROM factures_clients WHERE id = ?", (echeance["facture_client_id"],)
+    ).fetchone()
+    if not facture:
+        raise ValueError("Facture client introuvable.")
+    if not compte_reglement or not account_exists(conn, compte_reglement):
+        raise ValueError(f"Le compte de règlement « {compte_reglement} » n'existe pas.")
+    if account_racine(compte_reglement) != "5":
+        raise ValueError("Le compte de règlement doit être un compte de trésorerie (classe 5 — banque ou caisse).")
+    date_paiement = to_iso_date(date_paiement)
+    if not date_paiement:
+        raise ValueError("Date de paiement invalide.")
+    _check_exercice_editable(conn, date_paiement)
+
+    client = get_client(conn, facture["client_code"])
+    tiers_label = client["raison_sociale"] if client else facture["client_code"]
+    piece = facture["piece"] or f"REGL-{facture['id']}"
+    libelle = f"Règlement facture {piece} — tranche {echeance['numero_tranche']}"
+
+    add_entry(conn, date_paiement, piece, "BQ", compte_reglement, tiers_label, libelle,
+              echeance["montant"], 0)
+    add_entry(conn, date_paiement, piece, "BQ", "411000", tiers_label, libelle,
+              0, echeance["montant"], client_code=facture["client_code"])
+
+    conn.execute(
+        "UPDATE client_echeances SET date_paiement_reel = ?, compte_reglement = ? WHERE id = ?",
+        (date_paiement, compte_reglement, echeance_id),
+    )
+    conn.commit()
+
+    toutes_payees = all(e["date_paiement_reel"] for e in list_echeances_client(conn, echeance["facture_client_id"]))
+    if toutes_payees:
+        conn.execute(
+            "UPDATE factures_clients SET reglement_comptabilise = 1, date_paiement_reel = ?, "
+            "compte_reglement = ? WHERE id = ?",
+            (date_paiement, compte_reglement, echeance["facture_client_id"]),
+        )
+        conn.commit()
+    return echeance["montant"]
+
+
+def list_factures_avec_statut_paiement(conn):
+    """Liste des factures clients (Recouvrement) enrichie du montant
+    payé et d'un statut de paiement synthétique (Soldée / Partiellement
+    payée / Non soldée / En retard), à partir de l'échéancier de chacune
+    (voir list_echeances_client) — pour l'écran Recouvrement (filtrage,
+    clic pour ouvrir le paiement par tranche)."""
+    factures = list_factures(conn)
+    today = date.today().strftime("%Y-%m-%d")
+    for f in factures:
+        echeances = list_echeances_client(conn, f["id"])
+        total = sum(e["montant"] for e in echeances) or f["montant"]
+        paye = sum(e["montant"] for e in echeances if e["date_paiement_reel"])
+        restant = total - paye
+        f["montant_paye"] = paye
+        f["montant_restant"] = restant
+        f["en_retard"] = any(not e["date_paiement_reel"] and e["date_echeance"] < today for e in echeances)
+        if not echeances or restant <= 0.01:
+            f["statut_paiement_detail"] = "✓ Soldée"
+        elif paye > 0.01:
+            f["statut_paiement_detail"] = f"Partiellement payée ({paye:,.0f}/{total:,.0f})".replace(",", " ")
+        else:
+            f["statut_paiement_detail"] = "En retard" if f["en_retard"] else "Non soldée"
+    return factures
+
+    return echeance["montant"]
 
 
 # ---------------------------------------------------------------------------
@@ -5584,11 +5824,18 @@ def devalider_facture_vente(conn, facture_id):
     return deleted
 
 
-def valider_facture_vente(conn, facture_id, exercice=None):
+def valider_facture_vente(conn, facture_id, date_paiement_prevu=None, exercice=None):
     """Envoie la facture en Saisie : une écriture équilibrée (Débit Client / Crédit
     ventes + TVA), plus une sortie de stock automatique pour chaque ligne liée à un
-    compte de marchandises (31) ou de produits finis (36). Retourne la liste des
-    avertissements (ex. coût unitaire de stock inconnu)."""
+    compte de marchandises (31) ou de produits finis (36).
+
+    `date_paiement_prevu` (JJ/MM/AAAA ou AAAA-MM-JJ) : obligatoire — dès qu'elle est
+    renseignée, la facture est validée (comptabilisée) ET synchronisée automatiquement
+    vers COMMERCIAL > Recouvrement (création d'une facture client à suivre, avec son
+    échéancier — reprend les tranches planifiées via set_echeancier_facture_vente si
+    il y en a, sinon une seule tranche pour le montant TTC).
+
+    Retourne la liste des avertissements (ex. coût unitaire de stock inconnu)."""
     facture = get_facture_vente(conn, facture_id)
     if not facture:
         raise ValueError("Facture introuvable.")
@@ -5599,6 +5846,9 @@ def valider_facture_vente(conn, facture_id, exercice=None):
         raise ValueError("La facture ne contient aucune ligne.")
     if not client_exists(conn, facture["client_code"]):
         raise ValueError(f"Le client « {facture['client_code']} » n'existe pas.")
+    date_paiement_prevu = to_iso_date(date_paiement_prevu) if date_paiement_prevu else facture.get("date_paiement_prevu")
+    if not date_paiement_prevu:
+        raise ValueError("La date de règlement prévue est obligatoire pour valider une facture de vente.")
 
     totals = compute_facture_totals(conn, facture_id)
     date_str = facture["date_facture"]
@@ -5645,7 +5895,20 @@ def valider_facture_vente(conn, facture_id, exercice=None):
         add_entry(conn, date_str, piece, "VE", stock_compte, "", f"Sortie stock — {l['libelle']}",
                   0, montant_sortie, quantite=l["quantite"])
 
-    update_facture_vente(conn, facture_id, statut="validee", piece=piece)
+    update_facture_vente(conn, facture_id, statut="validee", piece=piece, date_paiement_prevu=date_paiement_prevu)
+
+    # Synchronise vers COMMERCIAL > Recouvrement : crée la facture client à suivre,
+    # avec son échéancier (reprend les tranches planifiées sur CETTE facture si elles
+    # existent, sinon une seule tranche pour le montant TTC).
+    facture_client_id = add_facture(conn, facture["client_code"], piece, facture["numero"], totals["total_ttc"],
+                                     date_str, date_echeance_override=date_paiement_prevu)
+    tranches_planifiees = list_echeances_facture_vente(conn, facture_id)
+    if tranches_planifiees:
+        set_echeancier_client(
+            conn, facture_client_id,
+            [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in tranches_planifiees])
+    update_facture_vente(conn, facture_id, facture_client_id=facture_client_id)
+
     return warnings
 
 
