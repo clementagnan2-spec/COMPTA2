@@ -727,9 +727,26 @@ def init_db(conn):
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS machines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nom TEXT NOT NULL,
+            compte_immobilisation TEXT,
+            categorie TEXT,
+            statut TEXT NOT NULL DEFAULT 'en fonctionnement',
+            notes TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_seuils (
+            compte TEXT PRIMARY KEY,
+            seuil_alerte REAL NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS reparations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             vehicule_id INTEGER,
+            machine_id INTEGER,
             date_reparation TEXT NOT NULL,
             description TEXT NOT NULL,
             garage TEXT,
@@ -963,6 +980,10 @@ def _migrate(conn):
     rg_cols = [r["name"] for r in conn.execute("PRAGMA table_info(reglements)")]
     if rg_cols and "facture_achat_id" not in rg_cols:
         conn.execute("ALTER TABLE reglements ADD COLUMN facture_achat_id INTEGER")
+
+    rep_cols = [r["name"] for r in conn.execute("PRAGMA table_info(reparations)")]
+    if rep_cols and "machine_id" not in rep_cols:
+        conn.execute("ALTER TABLE reparations ADD COLUMN machine_id INTEGER")
 
     # Migre l'ancien mécanisme "stock_initial_<compte>" (settings) vers opening_balances
     default_exercice = str(datetime.today().year)
@@ -8138,6 +8159,55 @@ def devalider_ep_bon_commande(conn, bon_id):
 # (menu TRANSPORT) que pour la maintenance générale (menu MAINTENANCE-ÉNERGIE).
 # ---------------------------------------------------------------------------
 
+# ---- Machines industrielles (équipements de production — état de fonctionnement) ----
+def add_machine(conn, nom, compte_immobilisation="", categorie="", statut="en fonctionnement", notes=""):
+    cur = conn.execute(
+        "INSERT INTO machines (nom, compte_immobilisation, categorie, statut, notes) VALUES (?, ?, ?, ?, ?)",
+        (nom, compte_immobilisation, categorie, statut, notes),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_machine(conn, machine_id, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE machines SET {cols} WHERE id = ?", (*fields.values(), machine_id))
+    conn.commit()
+
+
+def delete_machine(conn, machine_id):
+    conn.execute("DELETE FROM machines WHERE id = ?", (machine_id,))
+    conn.commit()
+
+
+def get_machine(conn, machine_id):
+    row = conn.execute("SELECT * FROM machines WHERE id = ?", (machine_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_machines(conn):
+    return [dict(r) for r in conn.execute("SELECT * FROM machines ORDER BY nom").fetchall()]
+
+
+# ---- Seuils d'alerte de stock (RAPPORTS TECHNIQUES > stocks critiques) ----
+def set_stock_seuil(conn, compte, seuil_alerte):
+    if seuil_alerte is None or seuil_alerte <= 0:
+        conn.execute("DELETE FROM stock_seuils WHERE compte = ?", (compte,))
+    else:
+        conn.execute(
+            "INSERT INTO stock_seuils (compte, seuil_alerte) VALUES (?, ?) "
+            "ON CONFLICT(compte) DO UPDATE SET seuil_alerte = excluded.seuil_alerte",
+            (compte, seuil_alerte),
+        )
+    conn.commit()
+
+
+def list_stock_seuils(conn):
+    return {r["compte"]: r["seuil_alerte"] for r in conn.execute("SELECT * FROM stock_seuils")}
+
+
 # ---- Parc auto ----
 def add_vehicule(conn, immatriculation, marque="", modele="", type_vehicule="",
                   date_acquisition="", chauffeur_affecte="", statut="actif", notes=""):
@@ -8245,14 +8315,14 @@ def list_pieces_rechange(conn):
 
 # ---- Réparations (véhicule optionnel — une réparation sans véhicule =
 # maintenance générale d'équipement, utilisée depuis le menu MAINTENANCE) ----
-def create_reparation(conn, description, vehicule_id=None, date_reparation=None, garage="",
+def create_reparation(conn, description, vehicule_id=None, machine_id=None, date_reparation=None, garage="",
                        cout_main_oeuvre=0, statut="en_cours", notes=""):
     date_reparation = date_reparation or date.today().strftime("%Y-%m-%d")
     cur = conn.execute(
-        """INSERT INTO reparations (vehicule_id, date_reparation, description, garage, cout_main_oeuvre,
-                                     statut, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (vehicule_id, date_reparation, description, garage, cout_main_oeuvre or 0, statut, notes),
+        """INSERT INTO reparations (vehicule_id, machine_id, date_reparation, description, garage,
+                                     cout_main_oeuvre, statut, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (vehicule_id, machine_id, date_reparation, description, garage, cout_main_oeuvre or 0, statut, notes),
     )
     conn.commit()
     return cur.lastrowid
@@ -8279,11 +8349,207 @@ def get_reparation(conn, reparation_id):
 
 def list_reparations(conn):
     rows = conn.execute(
-        """SELECT r.*, COALESCE(v.immatriculation, '') AS immatriculation
+        """SELECT r.*, COALESCE(v.immatriculation, '') AS immatriculation,
+                  COALESCE(m.nom, '') AS machine_nom
            FROM reparations r LEFT JOIN vehicules v ON v.id = r.vehicule_id
+                              LEFT JOIN machines m ON m.id = r.machine_id
            ORDER BY r.date_reparation DESC, r.id DESC"""
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def compute_rapport_technique(conn):
+    """Tableau de bord combiné (RAPPORTS TECHNIQUES) — regroupe en un seul
+    appel les 4 volets demandés : stocks critiques (comparés à leur seuil
+    d'alerte), machines industrielles (état de fonctionnement), parc auto
+    (disponibilité pour le ravitaillement) et maintenance (réparations en
+    cours/récentes, machines et véhicules confondus, avec leur coût)."""
+    # 1. Stocks critiques : comptes de stock (31-36) ayant un seuil d'alerte
+    #    renseigné et dont la quantité actuelle est à ou sous ce seuil.
+    seuils = list_stock_seuils(conn)
+    stocks = compute_stocks_detail(conn, prefixes=["31", "32", "33", "34", "35", "36"])
+    stocks_critiques = []
+    for s in stocks:
+        seuil = seuils.get(s["code"])
+        if seuil is not None and s["qte_finale"] <= seuil:
+            stocks_critiques.append({**s, "seuil_alerte": seuil})
+    stocks_critiques.sort(key=lambda s: s["qte_finale"])
+
+    # 2. Machines : répartition par statut.
+    machines = list_machines(conn)
+    machines_par_statut = {}
+    for m in machines:
+        machines_par_statut.setdefault(m["statut"], []).append(m)
+
+    # 3. Parc auto : répartition par statut + taux de disponibilité.
+    vehicules = list_vehicules(conn)
+    vehicules_par_statut = {}
+    for v in vehicules:
+        vehicules_par_statut.setdefault(v["statut"], []).append(v)
+    nb_vehicules = len(vehicules)
+    nb_disponibles = len(vehicules_par_statut.get("actif", []))
+    taux_disponibilite = (nb_disponibles / nb_vehicules * 100) if nb_vehicules else 0.0
+
+    # 4. Maintenance : réparations en cours (machines + véhicules), et coût total
+    #    des réparations sur les 90 derniers jours.
+    reparations = list_reparations(conn)
+    reparations_en_cours = [r for r in reparations if r["statut"] != "terminee" and r["statut"] != "terminée"]
+    date_limite = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+    reparations_recentes = [r for r in reparations if r["date_reparation"] >= date_limite]
+    cout_maintenance_90j = sum(r["cout_main_oeuvre"] for r in reparations_recentes)
+
+    return {
+        "stocks_critiques": stocks_critiques,
+        "machines": machines, "machines_par_statut": machines_par_statut,
+        "vehicules": vehicules, "vehicules_par_statut": vehicules_par_statut,
+        "nb_vehicules": nb_vehicules, "nb_disponibles": nb_disponibles,
+        "taux_disponibilite": taux_disponibilite,
+        "reparations_en_cours": reparations_en_cours,
+        "reparations_recentes": reparations_recentes,
+        "cout_maintenance_90j": cout_maintenance_90j,
+    }
+
+
+def _svg_bar_chart(titre, donnees, couleur="#1F4E78", largeur=560, hauteur_barre=26):
+    """Petit graphique en barres horizontales en SVG pur (aucune librairie
+    externe requise) — `donnees` : liste de (label, valeur). Utilisé dans
+    render_rapport_technique_html pour les graphiques du tableau de bord."""
+    if not donnees:
+        return f"<p style='color:#595959'>{titre} : aucune donnée.</p>"
+    max_val = max(v for _, v in donnees) or 1
+    hauteur = len(donnees) * (hauteur_barre + 8) + 40
+    label_w = 160
+    zone_w = largeur - label_w - 60
+    svg = [f"<svg width='{largeur}' height='{hauteur}' xmlns='http://www.w3.org/2000/svg' "
+           f"style='font-family:Segoe UI,Arial,sans-serif;font-size:12px'>"]
+    svg.append(f"<text x='0' y='18' font-size='14' font-weight='bold'>{titre}</text>")
+    y = 34
+    for label, val in donnees:
+        bar_w = (val / max_val) * zone_w if max_val else 0
+        svg.append(f"<text x='0' y='{y + hauteur_barre * 0.65:.0f}'>{label}</text>")
+        svg.append(f"<rect x='{label_w}' y='{y}' width='{bar_w:.1f}' height='{hauteur_barre}' fill='{couleur}' rx='3'/>")
+        svg.append(f"<text x='{label_w + bar_w + 6:.1f}' y='{y + hauteur_barre * 0.65:.0f}'>{val:,.0f}</text>".replace(",", " "))
+        y += hauteur_barre + 8
+    svg.append("</svg>")
+    return "\n".join(svg)
+
+
+def render_rapport_technique_html(conn):
+    """Tableau de bord technique complet (aperçu avant impression, à
+    enregistrer en PDF) : stocks critiques, machines, parc auto,
+    maintenance — avec graphiques en barres SVG à l'appui. Renvoie le HTML
+    en str (pas de fichier), pour usage local (bureau) ET distant (client
+    réseau)."""
+    d = compute_rapport_technique(conn)
+    societe_nom = get_company_value(conn, "societe_nom") or "(Dénomination non renseignée)"
+
+    stocks_html = "\n".join(
+        f"<tr><td>{s['code']}</td><td>{s['label']}</td><td style='text-align:right'>{s['qte_finale']:,.1f}</td>"
+        f"<td style='text-align:right'>{s['seuil_alerte']:,.1f}</td></tr>"
+        for s in d["stocks_critiques"]
+    ) or "<tr><td colspan='4' style='text-align:center;color:#1F7A1F'>✓ Aucun stock sous son seuil d'alerte.</td></tr>"
+
+    machines_html = "\n".join(
+        f"<tr><td>{m['nom']}</td><td>{m['categorie'] or ''}</td><td>{m['compte_immobilisation'] or ''}</td>"
+        f"<td>{m['statut']}</td></tr>"
+        for m in sorted(d["machines"], key=lambda m: m["statut"] != "en fonctionnement")
+    ) or "<tr><td colspan='4' style='text-align:center;color:#595959'>Aucune machine enregistrée.</td></tr>"
+
+    vehicules_html = "\n".join(
+        f"<tr><td>{v['immatriculation']}</td><td>{v['marque'] or ''} {v['modele'] or ''}</td>"
+        f"<td>{v['chauffeur_affecte'] or ''}</td><td>{v['statut']}</td></tr>"
+        for v in sorted(d["vehicules"], key=lambda v: v["statut"] != "actif")
+    ) or "<tr><td colspan='4' style='text-align:center;color:#595959'>Aucun véhicule enregistré.</td></tr>"
+
+    maintenance_html = "\n".join(
+        f"<tr><td>{to_display_date(r['date_reparation'])}</td>"
+        f"<td>{r['machine_nom'] or r['immatriculation'] or '—'}</td>"
+        f"<td>{r['description']}</td><td>{r['statut']}</td>"
+        f"<td style='text-align:right'>{r['cout_main_oeuvre']:,.0f}</td></tr>"
+        for r in d["reparations_en_cours"]
+    ) or "<tr><td colspan='5' style='text-align:center;color:#1F7A1F'>✓ Aucune réparation en cours.</td></tr>"
+
+    graph_stocks = _svg_bar_chart(
+        "Stocks critiques (quantité actuelle vs seuil)",
+        [(s["code"], s["qte_finale"]) for s in d["stocks_critiques"][:10]], couleur="#B00020")
+    graph_machines = _svg_bar_chart(
+        "Machines par état",
+        [(statut, len(liste)) for statut, liste in d["machines_par_statut"].items()], couleur="#1F4E78")
+    graph_vehicules = _svg_bar_chart(
+        "Véhicules par état",
+        [(statut, len(liste)) for statut, liste in d["vehicules_par_statut"].items()], couleur="#1F4E78")
+
+    return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8"><title>Rapport technique — {societe_nom}</title>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 30px; color: #111; font-size: 13px; }}
+  .toolbar {{ margin-bottom: 16px; }}
+  h1 {{ font-size: 20px; margin-bottom: 4px; }}
+  h2 {{ font-size: 15px; margin-top: 28px; border-bottom: 2px solid #1F4E78; padding-bottom: 4px; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+  th, td {{ border: 1px solid #ccc; padding: 6px 10px; font-size: 12px; }}
+  th {{ background: #1F4E78; color: white; text-align: left; }}
+  .synthese {{ display: flex; gap: 24px; margin: 12px 0; flex-wrap: wrap; }}
+  .carte {{ border: 1px solid #ccc; border-radius: 6px; padding: 12px 16px; min-width: 180px; }}
+  .carte .valeur {{ font-size: 22px; font-weight: bold; }}
+  .carte.alerte {{ border-color: #B00020; }}
+  .carte.alerte .valeur {{ color: #B00020; }}
+  .carte.ok .valeur {{ color: #1F7A1F; }}
+  @media print {{ .toolbar {{ display: none; }} }}
+</style></head>
+<body>
+<div class="toolbar"><button onclick="window.print()">🖨️ Imprimer / Enregistrer en PDF</button>
+  <span style="margin-left:10px;color:#595959;font-size:12px;">Aperçu avant impression — rien n'est encore imprimé.</span></div>
+
+<h1>RAPPORT TECHNIQUE — {societe_nom}</h1>
+<div style="color:#595959">Généré le {to_display_date(date.today().strftime('%Y-%m-%d'))}</div>
+
+<div class="synthese">
+  <div class="carte {'alerte' if d['stocks_critiques'] else 'ok'}">
+    <div>Stocks sous seuil critique</div><div class="valeur">{len(d['stocks_critiques'])}</div>
+  </div>
+  <div class="carte {'alerte' if d['machines_par_statut'].get('en panne') or d['machines_par_statut'].get('en maintenance') else 'ok'}">
+    <div>Machines hors service</div>
+    <div class="valeur">{len(d['machines_par_statut'].get('en panne', [])) + len(d['machines_par_statut'].get('en maintenance', []))}</div>
+  </div>
+  <div class="carte {'ok' if d['taux_disponibilite'] >= 70 else 'alerte'}">
+    <div>Véhicules disponibles</div>
+    <div class="valeur">{d['nb_disponibles']}/{d['nb_vehicules']} ({d['taux_disponibilite']:.0f}%)</div>
+  </div>
+  <div class="carte {'alerte' if d['reparations_en_cours'] else 'ok'}">
+    <div>Réparations en cours</div><div class="valeur">{len(d['reparations_en_cours'])}</div>
+  </div>
+</div>
+
+<h2>1. Production — Stocks critiques</h2>
+{graph_stocks}
+<table>
+<tr><th>Compte</th><th>Désignation</th><th>Quantité actuelle</th><th>Seuil d'alerte</th></tr>
+{stocks_html}
+</table>
+
+<h2>2. Machines industrielles — État de fonctionnement</h2>
+{graph_machines}
+<table>
+<tr><th>Machine</th><th>Catégorie</th><th>Compte d'immobilisation</th><th>Statut</th></tr>
+{machines_html}
+</table>
+
+<h2>3. Parc automobile — Disponibilité pour le ravitaillement</h2>
+{graph_vehicules}
+<table>
+<tr><th>Immatriculation</th><th>Marque / Modèle</th><th>Chauffeur</th><th>Statut</th></tr>
+{vehicules_html}
+</table>
+
+<h2>4. Maintenance — Réparations en cours (machines et véhicules)</h2>
+<p>Coût de maintenance total sur les 90 derniers jours : <b>{d['cout_maintenance_90j']:,.0f} F CFA</b></p>
+<table>
+<tr><th>Date</th><th>Machine / Véhicule</th><th>Description</th><th>Statut</th><th>Coût main d'œuvre</th></tr>
+{maintenance_html}
+</table>
+
+</body></html>"""
 
 
 def add_ligne_reparation(conn, reparation_id, piece_id, quantite=1):
@@ -8858,7 +9124,7 @@ MENU_STRUCTURE = [
     ("COMMERCIAL", [("Clients", "clients"), ("Recouvrement", "recouvrement"), ("Facturation", "facturation"),
                   ("Stocks", "stocks"), ("Marges bénéficiaires", "marges")]),
     ("PRODUCTION", [("Matières premières", "stocks"), ("Fabrication", "production"),
-                     ("Produits finis", "stocks")]),
+                     ("Produits finis", "stocks"), ("Machines", "machines")]),
     ("RAPPORTS FINANCIERS", [("Grand livre", "grand_livre"), ("Balance", "balance"),
                              ("Bilan SYSCOHADA", "bilan_syscohada"),
                              ("Compte de résultat (SIG)", "compte_resultat_sig"), ("TFT", "tft"),
@@ -8929,7 +9195,7 @@ def ajouter_niveaux_acces_suggeres_menus(conn):
                             "factures_frs", "bordereau_livraison", "reglements"]
     grh_menus = ["grh_personnel", "grh_time_sheet", "grh_kpi", "grh_tableau_bord", "grh_hs", "grh_paie"]
     tresorier_menus = ["tresorerie", "rapprochement_bancaire", "recouvrement", "reglements"]
-    usine_menus = ["stocks", "production", "transport", "missions", "pieces_rechange", "reparations",
+    usine_menus = ["stocks", "production", "machines", "transport", "missions", "pieces_rechange", "reparations",
                    "immobilisations", "amortissements", "energie", "maintenance", "rapports_technique"]
 
     for niveau, menus in (

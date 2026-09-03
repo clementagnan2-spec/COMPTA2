@@ -198,6 +198,7 @@ class ClientApp(tk.Tk):
         "clients": lambda parent, remote: RemoteClientsTab(parent, remote),
         "facturation": lambda parent, remote: RemoteFacturationTab(parent, remote),
         "stocks": lambda parent, remote: RemoteStocksTab(parent, remote),
+        "machines": lambda parent, remote: RemoteMachinesTab(parent, remote),
         "tresorerie": lambda parent, remote: RemoteTresorerieTab(parent, remote),
         "rapprochement_bancaire": lambda parent, remote: RemoteRapprochementBancaireTab(parent, remote),
         "immobilisations": lambda parent, remote: RemoteImmobilisationsTab(parent, remote),
@@ -239,9 +240,7 @@ class ClientApp(tk.Tk):
         "production": lambda parent, remote: RemoteProductionTab(parent, remote),
         "exercices": lambda parent, remote: RemoteExercicesTab(parent, remote),
         "synchronisation": lambda parent, remote: RemoteSynchronisationTab(parent, remote),
-        "rapports_technique": lambda parent, remote: RemotePlaceholderTab(
-            parent, remote, "Rapports technique",
-            "À définir — dites-moi quels rapports techniques vous voulez ici et je construis l'écran."),
+        "rapports_technique": lambda parent, remote: RemoteRapportTechniqueTab(parent, remote),
         "ouverture": lambda parent, remote: RemoteOuvertureTab(parent, remote),
         "plan_comptable": lambda parent, remote: RemotePlanComptableTab(parent, remote),
         "admin_factures": lambda parent, remote: RemotePlaceholderTab(
@@ -5995,10 +5994,275 @@ class RemoteReparationDialog(tk.Toplevel):
         self.on_saved()
 
 
+class RemoteMachinesTab(ttk.Frame):
+    """Machines industrielles via le réseau — équivalent réseau complet de
+    MachinesTab (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection):
+        super().__init__(parent)
+        self.remote = remote
+        self.selected_id = None
+        ttk.Label(self, text="MACHINES INDUSTRIELLES", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 8))
+
+        form = ttk.LabelFrame(self, text="Machine")
+        form.pack(fill="x", padx=16, pady=4)
+        ttk.Label(form, text="Nom / désignation :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.nom_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.nom_var, width=26).grid(row=0, column=1, padx=4)
+        ttk.Label(form, text="Catégorie :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.categorie_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.categorie_var, width=18).grid(row=0, column=3, padx=4)
+        ttk.Label(form, text="Compte d'immobilisation (optionnel) :").grid(
+            row=1, column=0, sticky="w", padx=4, pady=(4, 0))
+        self.compte_var = tk.StringVar()
+        self.compte_combo = ttk.Combobox(form, textvariable=self.compte_var, width=24)
+        self.compte_combo.grid(row=1, column=1, padx=4, pady=(4, 0))
+        self.compte_combo.bind("<KeyRelease>", self._on_compte_keyrelease)
+        self._refresh_compte_values()
+        ttk.Label(form, text="Statut :").grid(row=1, column=2, sticky="w", padx=(12, 4), pady=(4, 0))
+        self.statut_var = tk.StringVar(value="en fonctionnement")
+        ttk.Combobox(form, textvariable=self.statut_var, width=18, state="readonly",
+                     values=["en fonctionnement", "en panne", "en maintenance", "à l'arrêt"]).grid(
+            row=1, column=3, padx=4, pady=(4, 0))
+        ttk.Label(form, text="Notes :").grid(row=2, column=0, sticky="w", padx=4, pady=(4, 0))
+        self.notes_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.notes_var, width=60).grid(
+            row=2, column=1, columnspan=3, sticky="we", padx=4, pady=(4, 0))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=16, pady=6)
+        ttk.Button(btns, text="Ajouter", command=self.add).pack(side="left")
+        ttk.Button(btns, text="Mettre à jour la sélection", command=self.update_sel).pack(side="left", padx=8)
+        ttk.Button(btns, text="Supprimer la sélection", command=self.delete_sel).pack(side="left")
+        ttk.Button(btns, text="Effacer le formulaire", command=self.clear_form).pack(side="left", padx=8)
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=16, pady=8)
+        cols = ("id", "nom", "categorie", "compte", "statut", "notes")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        for c, h, w in zip(cols, ["ID", "Nom", "Catégorie", "Compte", "Statut", "Notes"],
+                           [40, 220, 140, 100, 140, 260]):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.tag_configure("panne", foreground="#B00020")
+        self.tree.tag_configure("maintenance", foreground="#B8860B")
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.refresh()
+
+    def _appeler(self, fonction, *args, **kwargs):
+        return appeler(self, self.remote, fonction, *args, **kwargs)
+
+    def _refresh_compte_values(self):
+        items = self._appeler("search_accounts", "2", limit=200)
+        if items is not APPEL_ECHEC:
+            self.compte_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "2"]
+
+    def _on_compte_keyrelease(self, event=None):
+        query = self.compte_var.get().strip()
+        if query:
+            items = self._appeler("search_accounts", query, limit=50)
+            if items is not APPEL_ECHEC:
+                self.compte_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "2"]
+
+    @staticmethod
+    def _extract_code(raw):
+        raw = (raw or "").strip()
+        return raw.split(" — ", 1)[0].strip() if " — " in raw else raw
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        v = self.tree.item(sel[0], "values")
+        self.selected_id = v[0]
+        self.nom_var.set(v[1]); self.categorie_var.set(v[2]); self.compte_var.set(v[3])
+        self.statut_var.set(v[4]); self.notes_var.set(v[5])
+
+    def clear_form(self):
+        self.selected_id = None
+        for var in (self.nom_var, self.categorie_var, self.compte_var, self.notes_var):
+            var.set("")
+        self.statut_var.set("en fonctionnement")
+
+    def add(self):
+        if not self.nom_var.get().strip():
+            messagebox.showwarning("Champ manquant", "Le nom de la machine est obligatoire.", parent=self)
+            return
+        if self._appeler("add_machine", self.nom_var.get().strip(), categorie=self.categorie_var.get().strip(),
+                          compte_immobilisation=self._extract_code(self.compte_var.get()),
+                          statut=self.statut_var.get(), notes=self.notes_var.get().strip()) is APPEL_ECHEC:
+            return
+        self.clear_form()
+        self.refresh()
+
+    def update_sel(self):
+        if not self.selected_id:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une machine.", parent=self)
+            return
+        if self._appeler("update_machine", self.selected_id, nom=self.nom_var.get().strip(),
+                          categorie=self.categorie_var.get().strip(),
+                          compte_immobilisation=self._extract_code(self.compte_var.get()),
+                          statut=self.statut_var.get(), notes=self.notes_var.get().strip()) is APPEL_ECHEC:
+            return
+        self.clear_form()
+        self.refresh()
+
+    def delete_sel(self):
+        if not self.selected_id:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une machine.", parent=self)
+            return
+        if messagebox.askyesno("Confirmer", "Supprimer cette machine ?", parent=self):
+            if self._appeler("delete_machine", self.selected_id) is APPEL_ECHEC:
+                return
+            self.clear_form()
+            self.refresh()
+
+    def refresh(self):
+        machines = self._appeler("list_machines")
+        if machines is APPEL_ECHEC:
+            return
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for m in machines:
+            tag = "panne" if m["statut"] == "en panne" else ("maintenance" if m["statut"] == "en maintenance" else "")
+            self.tree.insert("", "end", tags=(tag,) if tag else (), values=(
+                m["id"], m["nom"], m["categorie"] or "", m["compte_immobilisation"] or "",
+                m["statut"], m["notes"] or ""))
+
+
+class RemoteRapportTechniqueTab(ttk.Frame):
+    """Tableau de bord technique combiné via le réseau — équivalent
+    réseau complet de RapportTechniqueTab (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection):
+        super().__init__(parent)
+        self.remote = remote
+
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        scrollable = ttk.Frame(canvas)
+        scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas_window = canvas.create_window((0, 0), window=scrollable, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(canvas_window, width=e.width))
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>", lambda ev: canvas.yview_scroll(int(-ev.delta / 120), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        ttk.Label(scrollable, text="RAPPORTS TECHNIQUES", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(scrollable, text=(
+            "Vue combinée : production (stocks critiques), machines industrielles, parc auto "
+            "(disponibilité pour le ravitaillement) et maintenance."
+        ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
+
+        btn_bar = ttk.Frame(scrollable)
+        btn_bar.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Button(btn_bar, text="Actualiser", command=self.refresh).pack(side="left")
+        ttk.Button(btn_bar, text="📊 Voir le rapport complet avec graphiques (aperçu avant impression, PDF)",
+                   command=self.afficher_rapport_complet).pack(side="left", padx=12)
+
+        self.cartes_var = tk.StringVar()
+        ttk.Label(scrollable, textvariable=self.cartes_var, font=("Segoe UI", 11, "bold"),
+                  wraplength=1100).pack(anchor="w", padx=16, pady=(0, 12))
+
+        self.tab_stocks = self._make_section(scrollable, "1. Production — Stocks critiques",
+            ("compte", "libelle", "qte", "seuil"), ["Compte", "Désignation", "Quantité actuelle", "Seuil d'alerte"],
+            [90, 260, 130, 130])
+        self.tab_machines = self._make_section(scrollable, "2. Machines industrielles — État de fonctionnement",
+            ("nom", "categorie", "compte", "statut"), ["Machine", "Catégorie", "Compte", "Statut"],
+            [220, 150, 100, 150])
+        self.tab_vehicules = self._make_section(scrollable, "3. Parc automobile — Disponibilité",
+            ("immat", "marque", "chauffeur", "statut"), ["Immatriculation", "Marque/Modèle", "Chauffeur", "Statut"],
+            [130, 200, 150, 150])
+        self.tab_maintenance = self._make_section(scrollable, "4. Maintenance — Réparations en cours",
+            ("date", "cible", "description", "statut", "cout"), ["Date", "Machine/Véhicule", "Description",
+                                                                    "Statut", "Coût M.O."], [90, 180, 260, 110, 110])
+
+        self.refresh()
+
+    def _appeler(self, fonction, *args, **kwargs):
+        return appeler(self, self.remote, fonction, *args, **kwargs)
+
+    def _make_section(self, parent, titre, cols, headers, widths):
+        ttk.Label(parent, text=titre, font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
+        tree = ttk.Treeview(parent, columns=cols, show="headings", height=6)
+        for c, h, w in zip(cols, headers, widths):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor="w")
+        tree.tag_configure("alerte", foreground="#B00020")
+        tree.pack(fill="x", padx=16, pady=(0, 8))
+        return tree
+
+    def afficher_rapport_complet(self):
+        html = self._appeler("render_rapport_technique_html")
+        if html is APPEL_ECHEC:
+            return
+        import tempfile, webbrowser, os
+        path = os.path.join(tempfile.gettempdir(), "rapport_technique.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        webbrowser.open(f"file://{path}")
+
+    def refresh(self):
+        d = self._appeler("compute_rapport_technique")
+        if d is APPEL_ECHEC:
+            return
+
+        nb_machines_hs = len(d["machines_par_statut"].get("en panne", [])) + \
+            len(d["machines_par_statut"].get("en maintenance", []))
+        self.cartes_var.set(
+            f"⚠ Stocks sous seuil : {len(d['stocks_critiques'])}     "
+            f"⚠ Machines hors service : {nb_machines_hs}     "
+            f"🚚 Véhicules disponibles : {d['nb_disponibles']}/{d['nb_vehicules']} "
+            f"({d['taux_disponibilite']:.0f}%)     "
+            f"🔧 Réparations en cours : {len(d['reparations_en_cours'])}"
+        )
+
+        for row in self.tab_stocks.get_children():
+            self.tab_stocks.delete(row)
+        for s in d["stocks_critiques"]:
+            self.tab_stocks.insert("", "end", tags=("alerte",), values=(
+                s["code"], s["label"], f"{s['qte_finale']:g}", f"{s['seuil_alerte']:g}"))
+        if not d["stocks_critiques"]:
+            self.tab_stocks.insert("", "end", values=("", "✓ Aucun stock sous son seuil d'alerte", "", ""))
+
+        for row in self.tab_machines.get_children():
+            self.tab_machines.delete(row)
+        for m in sorted(d["machines"], key=lambda m: m["statut"] != "en fonctionnement"):
+            tag = "alerte" if m["statut"] in ("en panne", "en maintenance") else ()
+            self.tab_machines.insert("", "end", tags=(tag,) if tag else (), values=(
+                m["nom"], m["categorie"] or "", m["compte_immobilisation"] or "", m["statut"]))
+
+        for row in self.tab_vehicules.get_children():
+            self.tab_vehicules.delete(row)
+        for v in sorted(d["vehicules"], key=lambda v: v["statut"] != "actif"):
+            tag = "alerte" if v["statut"] != "actif" else ()
+            self.tab_vehicules.insert("", "end", tags=(tag,) if tag else (), values=(
+                v["immatriculation"], f"{v['marque'] or ''} {v['modele'] or ''}".strip(),
+                v["chauffeur_affecte"] or "", v["statut"]))
+
+        for row in self.tab_maintenance.get_children():
+            self.tab_maintenance.delete(row)
+        for r in d["reparations_en_cours"]:
+            self.tab_maintenance.insert("", "end", tags=("alerte",), values=(
+                core.to_display_date(r["date_reparation"]), r["machine_nom"] or r["immatriculation"] or "—",
+                r["description"], r["statut"], fmt_cfa(r["cout_main_oeuvre"])))
+        if not d["reparations_en_cours"]:
+            self.tab_maintenance.insert("", "end", values=("", "✓ Aucune réparation en cours", "", "", ""))
+
+
 class RemoteReparationsTab(ttk.Frame):
     """Réparations (TRANSPORT) via le réseau — équivalent réseau complet
     de ReparationsTab (bureau) : création + détail (double-clic) avec
-    pièces utilisées et main d'œuvre."""
+    pièces utilisées et main d'œuvre, pour un véhicule OU une machine."""
 
     def __init__(self, parent, remote: RemoteConnection):
         super().__init__(parent)
@@ -6010,24 +6274,35 @@ class RemoteReparationsTab(ttk.Frame):
         form.pack(fill="x", padx=16, pady=4)
         ttk.Label(form, text="Véhicule :").grid(row=0, column=0, sticky="w")
         self.vehicule_var = tk.StringVar()
-        self.vehicule_combo = ttk.Combobox(form, textvariable=self.vehicule_var, width=22, state="readonly")
+        self.vehicule_combo = ttk.Combobox(form, textvariable=self.vehicule_var, width=20, state="readonly")
         self.vehicule_combo.grid(row=0, column=1, padx=4)
-        ttk.Label(form, text="Description :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        ttk.Label(form, text="ou Machine :").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self.machine_var = tk.StringVar()
+        self.machine_combo = ttk.Combobox(form, textvariable=self.machine_var, width=20, state="readonly")
+        self.machine_combo.grid(row=0, column=3, padx=4)
+        ttk.Label(form, text="Description :").grid(row=0, column=4, sticky="w", padx=(12, 4))
         self.description_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.description_var, width=30).grid(row=0, column=3, padx=4)
-        ttk.Button(form, text="Nouvelle réparation", command=self.new_reparation).grid(row=0, column=4, padx=12)
+        ttk.Entry(form, textvariable=self.description_var, width=30).grid(row=0, column=5, padx=4)
+        ttk.Button(form, text="Nouvelle réparation", command=self.new_reparation).grid(row=0, column=6, padx=12)
+        ttk.Label(form, text="Choisissez soit un véhicule, soit une machine (pas les deux).",
+                  foreground="#595959").grid(row=1, column=0, columnspan=7, sticky="w", pady=(2, 0))
 
-        cols = ("id", "vehicule", "date", "description", "garage", "cout_mo", "cout_total", "statut")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=20)
-        headers = ["ID", "Véhicule", "Date", "Description", "Garage", "Main d'œuvre", "Coût total", "Statut"]
-        widths = [40, 130, 90, 220, 130, 100, 100, 100]
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=16, pady=8)
+        cols = ("id", "cible", "date", "description", "garage", "cout_mo", "cout_total", "statut")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        headers = ["ID", "Véhicule / Machine", "Date", "Description", "Garage", "Main d'œuvre", "Coût total", "Statut"]
+        widths = [40, 160, 90, 220, 130, 100, 100, 100]
         for c, h, w in zip(cols, headers, widths):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=16, pady=8)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self._on_double_click)
         ttk.Label(self, text="Double-cliquez sur une réparation pour gérer ses pièces utilisées.",
-                  foreground="#595959").pack(anchor="w", padx=16, pady=(0, 8))
+                  foreground="#595959").pack(anchor="w", padx=16, pady=(4, 8))
         self.refresh()
 
     def _appeler(self, fonction, *args, **kwargs):
@@ -6040,6 +6315,13 @@ class RemoteReparationsTab(ttk.Frame):
         self.vehicules = vehicules
         self.vehicule_combo["values"] = [f"{v['id']} — {v['immatriculation']}" for v in vehicules]
 
+    def _refresh_machine_values(self):
+        machines = self._appeler("list_machines")
+        if machines is APPEL_ECHEC:
+            return
+        self.machines = machines
+        self.machine_combo["values"] = [f"{m['id']} — {m['nom']}" for m in machines]
+
     def new_reparation(self):
         if not self.description_var.get().strip():
             messagebox.showwarning("Champ manquant", "La description est obligatoire.", parent=self)
@@ -6048,7 +6330,12 @@ class RemoteReparationsTab(ttk.Frame):
         raw = self.vehicule_var.get()
         if raw:
             vehicule_id = int(raw.split(" — ", 1)[0])
-        rid = self._appeler("create_reparation", self.description_var.get().strip(), vehicule_id=vehicule_id)
+        machine_id = None
+        raw_m = self.machine_var.get()
+        if raw_m:
+            machine_id = int(raw_m.split(" — ", 1)[0])
+        rid = self._appeler("create_reparation", self.description_var.get().strip(), vehicule_id=vehicule_id,
+                             machine_id=machine_id)
         if rid is APPEL_ECHEC:
             return
         self.description_var.set("")
@@ -6065,6 +6352,7 @@ class RemoteReparationsTab(ttk.Frame):
 
     def refresh(self):
         self._refresh_vehicule_values()
+        self._refresh_machine_values()
         reparations = self._appeler("list_reparations")
         if reparations is APPEL_ECHEC:
             return
@@ -6075,8 +6363,9 @@ class RemoteReparationsTab(ttk.Frame):
             cout_total = self._appeler("compute_cout_total_reparation", r["id"])
             if cout_total is APPEL_ECHEC:
                 return
+            cible = r.get("machine_nom") or r.get("immatriculation") or ""
             iid = self.tree.insert("", "end", values=(
-                r["id"], r.get("immatriculation") or "", core.to_display_date(r.get("date_reparation") or ""),
+                r["id"], cible, core.to_display_date(r.get("date_reparation") or ""),
                 r["description"], r.get("garage") or "", fmt_cfa(r["cout_main_oeuvre"]), fmt_cfa(cout_total),
                 r["statut"]))
             self._by_iid[iid] = r["id"]
