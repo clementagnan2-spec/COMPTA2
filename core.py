@@ -5830,6 +5830,52 @@ def compute_facture_totals(conn, facture_id):
     return {"total_ht": total_ht, "tva_taux": tva_taux, "tva_montant": tva_montant, "total_ttc": total_ttc}
 
 
+def compute_analyse_ca(conn, date_from=None, date_to=None):
+    """Analyse du chiffre d'affaires sur une période — deux tableaux de
+    contrôle côte à côte :
+    - à gauche : le total des ventes (classe 70, montant HT des factures
+      validées) scindé entre celles émises hors TVA (tva_taux = 0) et
+      celles émises avec TVA, dont le total doit correspondre au
+      mouvement des comptes de vente sur la période (le CA HT) ;
+    - à droite : le mouvement des comptes de TVA (443/444, TVA collectée)
+      et celui des comptes clients (411, montant facturé TTC) — pour
+      vérifier que Ventes HT + TVA collectée = Facturé TTC aux clients."""
+    date_from = date_from or f"{date.today().year}-01-01"
+    date_to = date_to or date.today().strftime("%Y-%m-%d")
+
+    ventes_hors_tva = 0.0
+    ventes_avec_tva = 0.0
+    for f in list_factures_vente(conn):
+        if f["statut"] != "validee":
+            continue
+        if not (date_from <= f["date_facture"] <= date_to):
+            continue
+        total_ht = sum(l["montant_ht"] for l in list_lignes_facture_vente(conn, f["id"]))
+        if (f["tva_taux"] or 0) == 0:
+            ventes_hors_tva += total_ht
+        else:
+            ventes_avec_tva += total_ht
+    total_gauche = ventes_hors_tva + ventes_avec_tva
+
+    comptes_tva = sum(
+        c["credit_periode"] - c["debit_periode"]
+        for prefix in ("443", "444")
+        for c in compute_comptes_prefixe_periode(conn, prefix, date_from=date_from, date_to=date_to)
+    )
+    comptes_clients = sum(
+        c["debit_periode"] - c["credit_periode"]
+        for c in compute_comptes_prefixe_periode(conn, "411", date_from=date_from, date_to=date_to)
+    )
+    total_droite = comptes_tva + comptes_clients
+
+    return {
+        "date_from": date_from, "date_to": date_to,
+        "ventes_hors_tva": ventes_hors_tva, "ventes_avec_tva": ventes_avec_tva, "total_gauche": total_gauche,
+        "comptes_tva": comptes_tva, "comptes_clients": comptes_clients, "total_droite": total_droite,
+        "ecart": total_gauche + comptes_tva - comptes_clients,
+    }
+
+
 def devalider_facture_vente(conn, facture_id):
     """Repasse une facture VALIDÉE en brouillon modifiable, en cas d'erreur
     sur les chiffres constatée après validation : supprime toutes les
@@ -9698,7 +9744,8 @@ MENU_STRUCTURE = [
                              ("Bilan SYSCOHADA", "bilan_syscohada"),
                              ("Compte de résultat (SIG)", "compte_resultat_sig"), ("TFT", "tft"),
                              ("Situation financière", "situation_financiere"),
-                             ("Arrêté de comptes", "arrete_comptes")]),
+                             ("Arrêté de comptes", "arrete_comptes"),
+                             ("Analyse du CA", "analyse_ca")]),
     ("ENGAGEMENTS-PROJETS", [("Fournisseurs", "fournisseurs"), ("Contrats", "contrats"),
                               ("Expression de besoin", "expression_besoin"),
                               ("Bon de commande", "ep_bon_commande"),
@@ -9757,7 +9804,7 @@ def ajouter_niveaux_acces_suggeres_menus(conn):
 
     comptable_menus = ["saisie", "ouverture", "grand_livre", "balance", "bilan_syscohada",
                         "compte_resultat_sig", "tft", "situation_financiere", "arrete_comptes",
-                        "tresorerie", "exercices", "plan_comptable", "plan_analytique",
+                        "analyse_ca", "tresorerie", "exercices", "plan_comptable", "plan_analytique",
                         "plan_budgetaire", "plan_bailleur", "synchronisation"]
     vendeur_menus = ["clients", "recouvrement", "commandes_client", "facturation", "stocks", "marges"]
     charge_achats_menus = ["fournisseurs", "contrats", "expression_besoin", "ep_bon_commande",

@@ -209,6 +209,7 @@ class App(tk.Tk):
         register("situation_financiere", EtatFormuleTab, "Situation financière (FR-BFR-TN)",
                  core._situation_template_path)
         register("arrete_comptes", ArreteComptesTab)
+        register("analyse_ca", AnalyseCaTab)
         register("grh_personnel", PersonnelTab)
         register("grh_time_sheet", TimeSheetTab)
         register("grh_kpi", KpiTab)
@@ -292,6 +293,7 @@ class App(tk.Tk):
             ("TFT", "tft"),
             ("Situation financière", "situation_financiere"),
             ("Arrêté de comptes", "arrete_comptes"),
+            ("Analyse du CA", "analyse_ca"),
         ])
         add_top_menu("ENGAGEMENTS-PROJETS", [
             ("Fournisseurs", "fournisseurs"),
@@ -4550,6 +4552,83 @@ class PaieTab(ttk.Frame):
         self.bulletins_tab.refresh()
         self.etat_tab.calculer()
         self.params_tab.refresh()
+
+
+class AnalyseCaTab(ttk.Frame):
+    """Analyse du chiffre d'affaires (menu RAPPORTS FINANCIERS) — deux
+    tableaux de contrôle côte à côte, sur une période choisie : ventes
+    (classe 70, scindées hors TVA / avec TVA) à gauche, comptes de TVA et
+    comptes clients (411) à droite — pour vérifier que Ventes HT + TVA
+    collectée correspond au montant facturé TTC aux clients."""
+
+    def __init__(self, parent, conn):
+        super().__init__(parent)
+        self.conn = conn
+        ttk.Label(self, text="ANALYSE DU CHIFFRE D'AFFAIRES", font=("Segoe UI", 14, "bold"),
+                  foreground="#B00020").pack(anchor="w", padx=16, pady=(16, 8))
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(top, text="Période :", foreground="#1F7A1F", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.date_from_var = tk.StringVar(value=f"{date.today().year}-01-01")
+        self.date_from_var.set(core.to_display_date(self.date_from_var.get()))
+        ttk.Entry(top, textvariable=self.date_from_var, width=12).pack(side="left", padx=(8, 4))
+        ttk.Label(top, text="au").pack(side="left", padx=4)
+        self.date_to_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(top, textvariable=self.date_to_var, width=12).pack(side="left", padx=4)
+        ttk.Button(top, text="Actualiser", command=self.refresh).pack(side="left", padx=12)
+
+        tables = ttk.Frame(self)
+        tables.pack(fill="x", padx=16)
+
+        gauche = ttk.Frame(tables, relief="solid", borderwidth=1)
+        gauche.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.lbl_hors_tva = self._row(gauche, "compte de la classe 70 ventes hors tva", 0)
+        self.lbl_avec_tva = self._row(gauche, "compte de la classe 70 ventes  avec tva", 1)
+        self.lbl_total_gauche = self._row(gauche, "TOTAL", 2, bold=True)
+
+        droite = ttk.Frame(tables, relief="solid", borderwidth=1)
+        droite.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        ttk.Label(droite, text="").grid(row=0, column=0, sticky="we", padx=4, pady=3)
+        self.lbl_tva = self._row(droite, "comptes de tva", 0)
+        self.lbl_clients = self._row(droite, "compte client de la classe 411", 1)
+        self.lbl_total_droite = self._row(droite, "TOTAL", 2, bold=True)
+
+        self.ecart_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.ecart_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=16, pady=(12, 4))
+        ttk.Label(self, text=(
+            "Vérification : Ventes hors TVA + Ventes avec TVA + TVA collectée doit correspondre au "
+            "montant facturé TTC aux clients (classe 411) sur la période."
+        ), foreground="#595959", wraplength=1000).pack(anchor="w", padx=16)
+
+        self.refresh()
+
+    def _row(self, parent, label, row, bold=False):
+        font = ("Segoe UI", 10, "bold") if bold else ("Segoe UI", 10)
+        ttk.Label(parent, text=label, font=font).grid(row=row, column=0, sticky="w", padx=6, pady=4)
+        var = tk.StringVar()
+        ttk.Label(parent, textvariable=var, font=font).grid(row=row, column=1, sticky="e", padx=12, pady=4)
+        parent.columnconfigure(1, weight=1)
+        return var
+
+    def refresh(self):
+        date_from = core.to_iso_date(self.date_from_var.get().strip())
+        date_to = core.to_iso_date(self.date_to_var.get().strip())
+        if not date_from or not date_to:
+            messagebox.showerror("Erreur", "Dates invalides.")
+            return
+        r = core.compute_analyse_ca(self.conn, date_from=date_from, date_to=date_to)
+        self.lbl_hors_tva.set(fmt_cfa(r["ventes_hors_tva"]))
+        self.lbl_avec_tva.set(fmt_cfa(r["ventes_avec_tva"]))
+        self.lbl_total_gauche.set(fmt_cfa(r["total_gauche"]))
+        self.lbl_tva.set(fmt_cfa(r["comptes_tva"]))
+        self.lbl_clients.set(fmt_cfa(r["comptes_clients"]))
+        self.lbl_total_droite.set(fmt_cfa(r["total_droite"]))
+        if abs(r["ecart"]) < 1:
+            self.ecart_var.set("✓ Cohérent (écart : 0)")
+        else:
+            self.ecart_var.set(f"⚠ Écart : {fmt_cfa(r['ecart'])} F CFA")
 
 
 class ArreteComptesTab(ttk.Frame):
