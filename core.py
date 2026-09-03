@@ -5949,6 +5949,38 @@ def valider_facture_vente(conn, facture_id, date_paiement_prevu=None, exercice=N
     return warnings
 
 
+def synchroniser_facture_vente_recouvrement(conn, facture_id, date_paiement_prevu):
+    """Rattrapage pour les factures VALIDÉES AVANT l'ajout de la
+    synchronisation automatique avec Paiement/Recouvrement (voir
+    valider_facture_vente) : crée la facture client à suivre (avec son
+    échéancier) SANS toucher à la comptabilité déjà passée — contrairement
+    à « Corriger cette facture », qui annulerait les écritures. Refuse si
+    la facture n'est pas validée, ou si elle est déjà synchronisée."""
+    facture = get_facture_vente(conn, facture_id)
+    if not facture:
+        raise ValueError("Facture introuvable.")
+    if facture["statut"] != "validee":
+        raise ValueError("Cette facture n'est pas validée — utilisez le bouton « Valider » normal.")
+    if facture.get("facture_client_id"):
+        raise ValueError("Cette facture est déjà synchronisée avec Paiement/Recouvrement.")
+    date_paiement_prevu = to_iso_date(date_paiement_prevu)
+    if not date_paiement_prevu:
+        raise ValueError("Date de règlement prévue invalide.")
+
+    totals = compute_facture_totals(conn, facture_id)
+    piece = facture["piece"] or facture["numero"]
+    facture_client_id = add_facture(conn, facture["client_code"], piece, facture["numero"], totals["total_ttc"],
+                                     facture["date_facture"], date_echeance_override=date_paiement_prevu)
+    tranches_planifiees = list_echeances_facture_vente(conn, facture_id)
+    if tranches_planifiees:
+        set_echeancier_client(
+            conn, facture_client_id,
+            [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in tranches_planifiees])
+    update_facture_vente(conn, facture_id, date_paiement_prevu=date_paiement_prevu,
+                          facture_client_id=facture_client_id)
+    return facture_client_id
+
+
 # ---------------------------------------------------------------------------
 # Factures fournisseurs (achats) — présente une facture d'achat (entête +
 # lignes + pied de page), et sa validation envoie automatiquement les

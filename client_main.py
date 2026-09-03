@@ -3894,6 +3894,16 @@ class RemoteFacturationTab(ttk.Frame):
         ttk.Label(echeancier_frame, textvariable=self.echeancier_apercu_var, foreground="#595959").pack(
             side="left", padx=12)
 
+        self.sync_frame = ttk.Frame(header)
+        self.sync_frame.grid(row=3, column=0, columnspan=8, sticky="we", padx=4, pady=(6, 0))
+        ttk.Label(self.sync_frame, text=(
+            "⚠ Cette facture est validée mais n'a jamais été envoyée dans Paiement/Recouvrement "
+            "(validée avant l'existence de cette liaison automatique) :"
+        ), foreground="#B00020").pack(side="left")
+        ttk.Button(self.sync_frame, text="Envoyer vers Paiement/Recouvrement (sans toucher à la comptabilité)",
+                   command=self.synchroniser_recouvrement).pack(side="left", padx=8)
+        self.sync_frame.grid_remove()
+
         ligne_frame = ttk.LabelFrame(self, text="Lignes (une fois la facture créée, sélectionnée dans la liste)")
         ligne_frame.pack(fill="x", padx=16, pady=(0, 8))
         ttk.Label(ligne_frame, text="Compte de vente :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
@@ -4073,6 +4083,37 @@ class RemoteFacturationTab(ttk.Frame):
         self.facture_id_selectionnee = int(v[0])
         self._refresh_lignes()
         self._refresh_echeancier_apercu()
+        self._refresh_sync_warning()
+
+    def _refresh_sync_warning(self):
+        if not self.facture_id_selectionnee:
+            self.sync_frame.grid_remove()
+            return
+        f = self._appeler("get_facture_vente", self.facture_id_selectionnee)
+        if f is APPEL_ECHEC or not f:
+            self.sync_frame.grid_remove()
+            return
+        if f["statut"] == "validee" and not f.get("facture_client_id"):
+            self.sync_frame.grid()
+        else:
+            self.sync_frame.grid_remove()
+
+    def synchroniser_recouvrement(self):
+        date_str = core.to_iso_date(self.date_paiement_prevu_var.get().strip())
+        if not date_str:
+            messagebox.showwarning(
+                "Date manquante",
+                "Renseignez la date de règlement prévu ci-dessus avant d'envoyer cette facture vers "
+                "Paiement/Recouvrement.", parent=self)
+            return
+        if self._appeler("synchroniser_facture_vente_recouvrement", self.facture_id_selectionnee,
+                          date_str) is APPEL_ECHEC:
+            return
+        messagebox.showinfo(
+            "Envoyée",
+            "Facture envoyée vers Paiement/Recouvrement, avec son échéancier — aucune écriture "
+            "comptable n'a été modifiée.", parent=self)
+        self._refresh_sync_warning()
 
     def _refresh_echeancier_apercu(self):
         if not self.facture_id_selectionnee:

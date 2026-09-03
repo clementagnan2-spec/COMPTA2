@@ -7305,6 +7305,16 @@ class FacturationTab(ttk.Frame):
         ttk.Label(echeancier_frame, textvariable=self.echeancier_apercu_var, foreground="#595959").pack(
             side="left", padx=12)
 
+        self.sync_frame = ttk.Frame(info)
+        self.sync_frame.grid(row=4, column=0, columnspan=8, sticky="we", padx=4, pady=(6, 0))
+        ttk.Label(self.sync_frame, text=(
+            "⚠ Cette facture est validée mais n'a jamais été envoyée dans Paiement/Recouvrement "
+            "(validée avant l'existence de cette liaison automatique) :"
+        ), foreground="#B00020").pack(side="left")
+        ttk.Button(self.sync_frame, text="Envoyer vers Paiement/Recouvrement (sans toucher à la comptabilité)",
+                   command=self.synchroniser_recouvrement).pack(side="left", padx=8)
+        self.sync_frame.grid_remove()
+
         # ---- Lignes ----
         form = ttk.LabelFrame(self, text="Ajouter une ligne (produit/service vendu — compte 70x)")
         form.pack(fill="x", padx=12, pady=6)
@@ -7492,12 +7502,35 @@ class FacturationTab(ttk.Frame):
                 f"{fmt_cfa(l['montant_ht'])}",
             ))
         self.date_paiement_prevu_var.set(core.to_display_date(f.get("date_paiement_prevu") or ""))
+        if f["statut"] == "validee" and not f.get("facture_client_id"):
+            self.sync_frame.grid()
+        else:
+            self.sync_frame.grid_remove()
         totals = core.compute_facture_totals(self.conn, self.current_facture_id)
         self.totals_var.set(
             f"TOTAL HT : {fmt_cfa(totals['total_ht'])}    TVA ({totals['tva_taux']:g}%) : "
             f"{fmt_cfa(totals['tva_montant'])}    TOTAL TTC : {fmt_cfa(totals['total_ttc'])}"
         )
         self._refresh_echeancier_apercu()
+
+    def synchroniser_recouvrement(self):
+        date_str = core.to_iso_date(self.date_paiement_prevu_var.get().strip())
+        if not date_str:
+            messagebox.showwarning(
+                "Date manquante",
+                "Renseignez la date de règlement prévu ci-dessus avant d'envoyer cette facture vers "
+                "Paiement/Recouvrement.")
+            return
+        try:
+            core.synchroniser_facture_vente_recouvrement(self.conn, self.current_facture_id, date_str)
+        except ValueError as exc:
+            messagebox.showerror("Erreur", str(exc))
+            return
+        messagebox.showinfo(
+            "Envoyée",
+            "Facture envoyée vers Paiement/Recouvrement, avec son échéancier — aucune écriture "
+            "comptable n'a été modifiée.")
+        self.load_facture()
 
     def _refresh_echeancier_apercu(self):
         if not self.current_facture_id:
