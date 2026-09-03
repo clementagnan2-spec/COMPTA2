@@ -1813,6 +1813,7 @@ class RemotePaieEtatTab(ttk.Frame):
             self.tree.column(key, width=width, anchor="w" if key in ("matricule", "nom", "prenom") else "e")
         self.tree.pack(fill="x", padx=12, pady=(0, 4))
         self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.tag_configure("total", background="#1F4E78", foreground="white", font=("Segoe UI", 10, "bold"))
         ttk.Label(self, text="Double-cliquez une ligne pour l'aperçu avant impression du bulletin.",
                   foreground="#595959").pack(anchor="w", padx=12)
 
@@ -1841,6 +1842,13 @@ class RemotePaieEtatTab(ttk.Frame):
             values = [fmt_cfa(l[k]) if k not in ("matricule", "nom", "prenom") else l[k]
                       for k, _, _ in self.RESULT_COLS]
             self.tree.insert("", "end", iid=str(l["bulletin_id"]), values=values)
+        if etat["lignes"]:
+            numeric_keys = [k for k, _, _ in self.RESULT_COLS if k not in ("matricule", "nom", "prenom")]
+            totaux_row = ["", "TOTAL — comptabilisé lors de la validation", ""]
+            for k in numeric_keys:
+                total_k = sum(l[k] for l in etat["lignes"])
+                totaux_row.append(fmt_cfa(total_k))
+            self.tree.insert("", "end", tags=("total",), values=totaux_row)
         t = etat["totaux"]
         self.totaux_var.set(
             f"Total Net Perçu : {fmt_cfa(t['net_percu'])}   Total CNSS : {fmt_cfa(t['cnss_total'])}   "
@@ -1899,6 +1907,8 @@ class RemotePaieEtatTab(ttk.Frame):
     def _on_double_click(self, event=None):
         sel = self.tree.selection()
         if not sel:
+            return
+        if "total" in self.tree.item(sel[0], "tags"):
             return
         bulletin_id = int(sel[0])
         html = self._appeler("render_bulletin_paie_html", bulletin_id)
