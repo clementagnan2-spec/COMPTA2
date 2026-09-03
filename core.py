@@ -10378,11 +10378,14 @@ PAIE_COMPTES = {
 
 def valider_paie_periode(conn, periode, date_str=None, piece=None):
     """Comptabilise la paie d'une période entière (tous les bulletins
-    saisis) : pour chaque employé, une écriture regroupant la rémunération
-    brute (débit 661100), les retenues salariales (crédit CNSS 431000,
-    IUTS 447210, retenue obligatoire 447220, remboursement prêt 421000) et
-    le net à payer (crédit 422000) ; puis les charges patronales (débit
-    664100/664200, crédit CNSS 431000 / TPA 442810).
+    saisis) par une ÉCRITURE DE CENTRALISATION — une seule ligne par
+    compte pour l'ensemble des salariés (pratique comptable standard pour
+    la paie), et non une écriture par salarié : débit rémunération brute
+    totale (661100), crédit retenues salariales totales (CNSS 431000,
+    IUTS 447210, retenue obligatoire 447220, remboursements de prêts
+    421000) et net à payer total (422000) ; puis les charges patronales
+    (débit 664100/664200, crédit CNSS 431000 / TPA 442810). Le détail par
+    salarié reste consultable (bulletins individuels, État de paie).
 
     Marque la période comme VALIDÉE : les bulletins ne peuvent plus être
     modifiés ni supprimés ensuite (cohérent avec le fonctionnement des
@@ -10402,35 +10405,41 @@ def valider_paie_periode(conn, periode, date_str=None, piece=None):
         date_str = f"{annee:04d}-{mois:02d}-{dernier_jour:02d}"
     piece = piece or f"PAIE-{periode}"
 
-    for l in etat["lignes"]:
-        libelle = f"Paie {periode} — {l['nom']} {l['prenom'] or ''}".strip()
-        O = l["remuneration_totale"]
-        if O > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["salaires"], "", libelle, O, 0)
-        if l["cnss_salariale"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["cnss"], "", libelle, 0, l["cnss_salariale"])
-        if l["iuts_net"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["iuts"], "", libelle, 0, l["iuts_net"])
-        if l["retenue_obligatoire"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["retenue_obligatoire"], "", libelle,
-                      0, l["retenue_obligatoire"])
-        if l["retenue_pret"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["avance_pret"], "", libelle,
-                      0, l["retenue_pret"])
-        if l["net_percu"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["remunerations_dues"], "", libelle,
-                      0, l["net_percu"])
-        # Charges patronales
-        if l["cnss_patronale"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["charges_cnss_patronale"], "",
-                      f"Charges patronales CNSS — {libelle}", l["cnss_patronale"], 0)
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["cnss"], "",
-                      f"Charges patronales CNSS — {libelle}", 0, l["cnss_patronale"])
-        if l["tpa_patronale"] > 0:
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["charges_tpa"], "",
-                      f"TPA patronale — {libelle}", l["tpa_patronale"], 0)
-            add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["tpa_a_payer"], "",
-                      f"TPA patronale — {libelle}", 0, l["tpa_patronale"])
+    libelle = f"Paie {periode} — centralisation ({len(etat['lignes'])} salarié(s))"
+    total_remuneration = sum(l["remuneration_totale"] for l in etat["lignes"])
+    total_cnss_salariale = sum(l["cnss_salariale"] for l in etat["lignes"])
+    total_iuts = sum(l["iuts_net"] for l in etat["lignes"])
+    total_retenue_obligatoire = sum(l["retenue_obligatoire"] for l in etat["lignes"])
+    total_retenue_pret = sum(l["retenue_pret"] for l in etat["lignes"])
+    total_net_percu = sum(l["net_percu"] for l in etat["lignes"])
+    total_cnss_patronale = sum(l["cnss_patronale"] for l in etat["lignes"])
+    total_tpa_patronale = sum(l["tpa_patronale"] for l in etat["lignes"])
+
+    if total_remuneration > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["salaires"], "", libelle, total_remuneration, 0)
+    if total_cnss_salariale > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["cnss"], "", libelle, 0, total_cnss_salariale)
+    if total_iuts > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["iuts"], "", libelle, 0, total_iuts)
+    if total_retenue_obligatoire > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["retenue_obligatoire"], "", libelle,
+                  0, total_retenue_obligatoire)
+    if total_retenue_pret > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["avance_pret"], "", libelle, 0, total_retenue_pret)
+    if total_net_percu > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["remunerations_dues"], "", libelle,
+                  0, total_net_percu)
+    # Charges patronales
+    if total_cnss_patronale > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["charges_cnss_patronale"], "",
+                  f"Charges patronales CNSS — {libelle}", total_cnss_patronale, 0)
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["cnss"], "",
+                  f"Charges patronales CNSS — {libelle}", 0, total_cnss_patronale)
+    if total_tpa_patronale > 0:
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["charges_tpa"], "",
+                  f"TPA patronale — {libelle}", total_tpa_patronale, 0)
+        add_entry(conn, date_str, piece, "OD", PAIE_COMPTES["tpa_a_payer"], "",
+                  f"TPA patronale — {libelle}", 0, total_tpa_patronale)
 
     conn.execute(
         "INSERT OR REPLACE INTO paie_periodes_validees (periode, date_validation, piece) VALUES (?, ?, ?)",
