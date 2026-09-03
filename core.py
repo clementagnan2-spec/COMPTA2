@@ -618,6 +618,43 @@ def init_db(conn):
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS commandes_client (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero TEXT NOT NULL,
+            date_commande TEXT NOT NULL,
+            client_code TEXT,
+            entete TEXT,
+            pied_page TEXT,
+            statut TEXT NOT NULL DEFAULT 'brouillon',
+            tva_taux REAL NOT NULL DEFAULT 0,
+            tva_compte TEXT,
+            date_paiement_attendu TEXT,
+            piece TEXT,
+            facture_vente_id INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS commande_client_lignes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commande_id INTEGER NOT NULL,
+            libelle TEXT NOT NULL,
+            quantite REAL NOT NULL DEFAULT 0,
+            prix_unitaire REAL NOT NULL DEFAULT 0,
+            unite TEXT,
+            compte_vente TEXT,
+            analytic_code TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS commande_client_echeances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commande_id INTEGER NOT NULL,
+            numero_tranche INTEGER NOT NULL,
+            date_echeance TEXT NOT NULL,
+            montant REAL NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS bon_commande_echeances (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             bon_commande_id INTEGER NOT NULL,
@@ -7697,6 +7734,242 @@ def compute_ep_bon_commande_totals(conn, bon_id):
             "net_a_payer": net_a_payer}
 
 
+# ---------------------------------------------------------------------------
+# Commandes client (COMMERCIAL > Commandes) — miroir exact du circuit Bon de
+# commande fournisseur (ENGAGEMENTS-PROJETS), mais côté ventes : comptes de
+# produits (classe 70x) et comptes clients (411x) au lieu des comptes de
+# charge et fournisseurs. Une commande validée génère une Facture de vente
+# (brouillon, lignes recopiées) — voir valider_commande_client. L'échéancier
+# planifié sur la commande est repris automatiquement sur la facture.
+# ---------------------------------------------------------------------------
+def create_commande_client(conn, numero, date_commande, client_code="", entete="", pied_page="",
+                            tva_taux=None, tva_compte=None):
+    tva_taux = TVA_TAUX_DEFAUT if tva_taux is None else tva_taux
+    tva_compte = tva_compte or COMPTE_TVA_VENTES
+    cur = conn.execute(
+        """INSERT INTO commandes_client (numero, date_commande, client_code, entete, pied_page, statut,
+                                          tva_taux, tva_compte)
+           VALUES (?, ?, ?, ?, ?, 'brouillon', ?, ?)""",
+        (numero, date_commande, client_code, entete, pied_page, tva_taux, tva_compte),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_commande_client(conn, commande_id, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE commandes_client SET {cols} WHERE id = ?", (*fields.values(), commande_id))
+    conn.commit()
+
+
+def delete_commande_client(conn, commande_id):
+    conn.execute("DELETE FROM commande_client_lignes WHERE commande_id = ?", (commande_id,))
+    conn.execute("DELETE FROM commande_client_echeances WHERE commande_id = ?", (commande_id,))
+    conn.execute("DELETE FROM commandes_client WHERE id = ?", (commande_id,))
+    conn.commit()
+
+
+def get_commande_client(conn, commande_id):
+    row = conn.execute("SELECT * FROM commandes_client WHERE id = ?", (commande_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_commandes_client(conn):
+    """Liste des commandes client, avec calcul du retard (même principe
+    que list_ep_bons_commande côté fournisseurs)."""
+    rows = conn.execute(
+        """SELECT cc.*, COALESCE(cl.raison_sociale, cc.client_code, '') AS raison_sociale
+           FROM commandes_client cc LEFT JOIN clients cl ON cl.code = cc.client_code
+           ORDER BY cc.date_commande DESC, cc.id DESC"""
+    ).fetchall()
+    result = [dict(r) for r in rows]
+    today = date.today().strftime("%Y-%m-%d")
+    for r in result:
+        if not r.get("date_paiement_attendu") or r["statut"] != "validee":
+            r["statut_paiement"] = ""
+            r["depassement_paiement"] = False
+            continue
+        if today > r["date_paiement_attendu"]:
+            retard = (datetime.strptime(today, "%Y-%m-%d")
+                      - datetime.strptime(r["date_paiement_attendu"], "%Y-%m-%d")).days
+            r["statut_paiement"] = f"EN RETARD ({retard} j)"
+            r["depassement_paiement"] = True
+        else:
+            r["statut_paiement"] = "En attente"
+            r["depassement_paiement"] = False
+    return result
+
+
+def add_ligne_commande_client(conn, commande_id, libelle, quantite, prix_unitaire=0, unite=None,
+                               compte_vente=None, analytic_code=None):
+    conn.execute(
+        """INSERT INTO commande_client_lignes (commande_id, libelle, quantite, prix_unitaire, unite,
+                                                 compte_vente, analytic_code)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (commande_id, libelle, quantite or 0, prix_unitaire or 0, unite or None, compte_vente or None,
+         analytic_code or None),
+    )
+    conn.commit()
+
+
+def update_ligne_commande_client(conn, ligne_id, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE commande_client_lignes SET {cols} WHERE id = ?", (*fields.values(), ligne_id))
+    conn.commit()
+
+
+def delete_ligne_commande_client(conn, ligne_id):
+    conn.execute("DELETE FROM commande_client_lignes WHERE id = ?", (ligne_id,))
+    conn.commit()
+
+
+def list_lignes_commande_client(conn, commande_id):
+    rows = conn.execute(
+        "SELECT * FROM commande_client_lignes WHERE commande_id = ? ORDER BY id", (commande_id,)
+    ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["montant_ht"] = (d["quantite"] or 0) * (d["prix_unitaire"] or 0)
+        type_stock, _, _ = (
+            _match_stock_mapping(d["compte_vente"], VENTE_STOCK_MAPPING) if d["compte_vente"] else (None, None, None)
+        ) or (None, None, None)
+        d["type_stock"] = type_stock
+        result.append(d)
+    return result
+
+
+def compute_commande_client_totals(conn, commande_id):
+    commande = get_commande_client(conn, commande_id)
+    lignes = list_lignes_commande_client(conn, commande_id)
+    total_ht = sum(l["montant_ht"] for l in lignes)
+    tva_taux = commande["tva_taux"] if commande else 0
+    tva_montant = total_ht * (tva_taux or 0) / 100
+    total_ttc = total_ht + tva_montant
+    return {"total_ht": total_ht, "tva_taux": tva_taux, "tva_montant": tva_montant, "total_ttc": total_ttc}
+
+
+def list_echeances_commande_client(conn, commande_id):
+    """Échéancier de règlement PLANIFIÉ sur une Commande client en
+    brouillon — purement prévisionnel, repris automatiquement sur la
+    Facture de vente générée à la validation (voir valider_commande_client)."""
+    rows = conn.execute(
+        "SELECT * FROM commande_client_echeances WHERE commande_id = ? ORDER BY numero_tranche", (commande_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_echeancier_commande_client(conn, commande_id, tranches):
+    """Définit (ou remplace) l'échéancier de règlement PRÉVU d'une
+    Commande client — `tranches` : liste de dicts {date_echeance, montant}.
+    La somme doit correspondre au montant TTC de la commande."""
+    commande = get_commande_client(conn, commande_id)
+    if not commande:
+        raise ValueError("Commande introuvable.")
+    if not tranches:
+        raise ValueError("L'échéancier doit contenir au moins une tranche.")
+    totals = compute_commande_client_totals(conn, commande_id)
+    total_tranches = 0.0
+    lignes_validees = []
+    for i, t in enumerate(tranches, start=1):
+        date_echeance = to_iso_date(t.get("date_echeance", ""))
+        if not date_echeance:
+            raise ValueError(f"Tranche {i} : date d'échéance invalide.")
+        try:
+            montant = float(t.get("montant") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"Tranche {i} : montant invalide.")
+        if montant <= 0:
+            raise ValueError(f"Tranche {i} : le montant doit être strictement positif.")
+        total_tranches += montant
+        lignes_validees.append((date_echeance, montant))
+    if abs(total_tranches - totals["total_ttc"]) > 1:
+        raise ValueError(
+            f"La somme des tranches ({total_tranches:,.0f}) doit correspondre au montant TTC "
+            f"({totals['total_ttc']:,.0f})."
+        )
+    conn.execute("DELETE FROM commande_client_echeances WHERE commande_id = ?", (commande_id,))
+    for i, (date_echeance, montant) in enumerate(sorted(lignes_validees, key=lambda x: x[0]), start=1):
+        conn.execute(
+            "INSERT INTO commande_client_echeances (commande_id, numero_tranche, date_echeance, montant) "
+            "VALUES (?, ?, ?, ?)",
+            (commande_id, i, date_echeance, montant),
+        )
+    conn.commit()
+
+
+def valider_commande_client(conn, commande_id):
+    """Valide la Commande client : fait basculer la commande en FACTURE DE
+    VENTE (brouillon, lignes recopiées avec leur compte de produit/code
+    analytique) — AUCUNE écriture comptable à ce stade. C'est la validation
+    de cette facture (voir valider_facture_vente, avec sa date de règlement
+    prévu) qui comptabilise la vente et synchronise vers Recouvrement.
+    L'échéancier planifié sur la commande (s'il y en a un) est repris
+    automatiquement sur la facture générée. Chaque ligne DOIT avoir un
+    compte de produit choisi et un client doit être renseigné, sous peine
+    de refus explicite. Retourne l'ID de la facture de vente créée."""
+    commande = get_commande_client(conn, commande_id)
+    if not commande:
+        raise ValueError("Commande introuvable.")
+    if commande["statut"] == "validee":
+        raise ValueError("Cette commande est déjà validée.")
+    lignes = list_lignes_commande_client(conn, commande_id)
+    if not lignes:
+        raise ValueError("Ajoutez au moins une ligne avant de valider.")
+    if not commande["client_code"] or not client_exists(conn, commande["client_code"]):
+        raise ValueError("Choisissez un client existant avant de valider cette commande.")
+    for l in lignes:
+        if not l["compte_vente"] or not account_exists(conn, l["compte_vente"]):
+            raise ValueError(
+                f"La ligne « {l['libelle']} » n'a pas de compte de produit valide — "
+                f"complétez-la avant de valider."
+            )
+
+    facture_id = create_facture_vente(conn, commande["numero"], commande["date_commande"], commande["client_code"],
+                                       entete=commande["entete"], pied_page=commande["pied_page"],
+                                       tva_taux=commande["tva_taux"], tva_compte=commande["tva_compte"])
+    for l in lignes:
+        add_ligne_facture_vente(conn, facture_id, l["compte_vente"], l["libelle"], l["quantite"],
+                                 l["prix_unitaire"], analytic_code=l.get("analytic_code"))
+
+    tranches_planifiees = list_echeances_commande_client(conn, commande_id)
+    if tranches_planifiees:
+        set_echeancier_facture_vente(
+            conn, facture_id,
+            [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in tranches_planifiees])
+
+    update_commande_client(conn, commande_id, statut="validee", facture_vente_id=facture_id)
+    conn.commit()
+    return facture_id
+
+
+def devalider_commande_client(conn, commande_id):
+    """Repasse une Commande client VALIDÉE en brouillon modifiable, en cas
+    d'erreur constatée après validation. La validation d'une commande ne
+    comptabilise rien (elle ne fait que générer une facture brouillon) —
+    rien à retirer de la Saisie ici ; si la facture générée a déjà été
+    validée à son tour, corrigez-la séparément (COMMERCIAL > Facturation >
+    Corriger cette facture) avant de corriger la commande."""
+    commande = get_commande_client(conn, commande_id)
+    if not commande:
+        raise ValueError("Commande introuvable.")
+    if commande["statut"] != "validee":
+        raise ValueError("Cette commande n'est pas validée — rien à corriger.")
+    if commande.get("facture_vente_id"):
+        facture = get_facture_vente(conn, commande["facture_vente_id"])
+        if facture and facture["statut"] == "validee":
+            raise ValueError(
+                "La facture générée par cette commande est déjà validée (comptabilisée) — corrigez-la "
+                "d'abord dans COMMERCIAL > Facturation avant de pouvoir corriger cette commande."
+            )
+    update_commande_client(conn, commande_id, statut="brouillon")
+    conn.commit()
+
+
 def list_echeances_bon_commande(conn, bon_id):
     """Échéancier de paiement PLANIFIÉ (une ou plusieurs tranches) sur un
     Bon de commande — purement prévisionnel à ce stade (rien n'est encore
@@ -9384,7 +9657,8 @@ def synchroniser_base(conn):
 # ---------------------------------------------------------------------------
 MENU_STRUCTURE = [
     ("SAISIE", [("Saisie des écritures", "saisie"), ("Soldes d'ouverture", "ouverture")]),
-    ("COMMERCIAL", [("Clients", "clients"), ("Recouvrement", "recouvrement"), ("Facturation", "facturation"),
+    ("COMMERCIAL", [("Clients", "clients"), ("Recouvrement", "recouvrement"), ("Commandes", "commandes_client"),
+                  ("Facturation", "facturation"),
                   ("Stocks", "stocks"), ("Marges bénéficiaires", "marges")]),
     ("PRODUCTION", [("Matières premières", "stocks"), ("Fabrication", "production"),
                      ("Produits finis", "stocks"), ("Machines", "machines")]),
@@ -9453,7 +9727,7 @@ def ajouter_niveaux_acces_suggeres_menus(conn):
                         "compte_resultat_sig", "tft", "situation_financiere", "arrete_comptes",
                         "tresorerie", "exercices", "plan_comptable", "plan_analytique",
                         "plan_budgetaire", "plan_bailleur", "synchronisation"]
-    vendeur_menus = ["clients", "recouvrement", "facturation", "stocks", "marges"]
+    vendeur_menus = ["clients", "recouvrement", "commandes_client", "facturation", "stocks", "marges"]
     charge_achats_menus = ["fournisseurs", "contrats", "expression_besoin", "ep_bon_commande",
                             "factures_frs", "bordereau_livraison", "reglements"]
     grh_menus = ["grh_personnel", "grh_time_sheet", "grh_kpi", "grh_tableau_bord", "grh_hs", "grh_paie"]

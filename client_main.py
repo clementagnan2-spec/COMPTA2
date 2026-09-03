@@ -206,6 +206,7 @@ class ClientApp(tk.Tk):
         "ep_bon_commande": lambda parent, remote: RemoteBonCommandeTab(parent, remote),
         "factures_frs": lambda parent, remote: RemoteFacturesFrsTab(parent, remote),
         "recouvrement": lambda parent, remote: RemoteRecouvrementTab(parent, remote),
+        "commandes_client": lambda parent, remote: RemoteCommandeClientTab(parent, remote),
         "marges": lambda parent, remote: RemoteMargesTab(parent, remote),
         "contrats": lambda parent, remote: RemoteContratsTab(parent, remote),
         "bordereau_livraison": lambda parent, remote: RemoteBordereauLivraisonTab(parent, remote),
@@ -3191,6 +3192,557 @@ class RemoteClientsTab(ttk.Frame):
         for c in clients:
             self.tree.insert("", "end", values=(c["code"], c["raison_sociale"], c["contact"] or "",
                                                  c["telephone"] or ""))
+
+
+class RemoteCommandeClientEcheancierDialog(tk.Toplevel):
+    """Planifie l'échéancier de règlement PRÉVU d'une Commande client via
+    le réseau — équivalent réseau complet de CommandeClientEcheancierDialog
+    (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection, commande_id, montant_ttc, on_saved):
+        super().__init__(parent)
+        self.remote = remote
+        self.commande_id = commande_id
+        self.montant_ttc = montant_ttc
+        self.on_saved = on_saved
+        self.title("Échéancier de règlement prévu")
+        self.geometry("560x420")
+        self.transient(parent)
+        self.grab_set()
+
+        ttk.Label(self, text=(
+            f"Montant TTC : {fmt_cfa(montant_ttc)} F CFA — répartissez ce montant sur une ou plusieurs "
+            f"échéances prévues (purement planifié, rien n'est encore comptabilisé)."
+        ), wraplength=520, foreground="#595959").pack(anchor="w", padx=10, pady=(10, 6))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=10)
+        ttk.Label(form, text="Échéance (JJ/MM/AAAA) :").grid(row=0, column=0, sticky="w", padx=4)
+        self.date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        ttk.Entry(form, textvariable=self.date_var, width=12).grid(row=0, column=1, padx=4)
+        ttk.Label(form, text="Montant :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.montant_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.montant_var, width=14).grid(row=0, column=3, padx=4)
+        ttk.Button(form, text="Ajouter la tranche", command=self.ajouter_tranche).grid(row=0, column=4, padx=12)
+
+        self.tree = ttk.Treeview(self, columns=("date", "montant"), show="headings", height=8)
+        self.tree.heading("date", text="Échéance")
+        self.tree.heading("montant", text="Montant")
+        self.tree.column("date", width=140, anchor="w")
+        self.tree.column("montant", width=160, anchor="e")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Button(self, text="Retirer la tranche sélectionnée", command=self.retirer_tranche).pack(
+            anchor="w", padx=10)
+
+        self.total_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.total_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=10, pady=6)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text="Enregistrer l'échéancier", command=self.enregistrer).pack(side="left")
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="left", padx=8)
+
+        self.tranches = []
+        existantes = appeler(self, remote, "list_echeances_commande_client", commande_id)
+        if existantes is not APPEL_ECHEC:
+            self.tranches = [{"date_echeance": t["date_echeance"], "montant": t["montant"]} for t in existantes]
+        self._refresh_tree()
+
+    def _refresh_tree(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        total = 0.0
+        for t in self.tranches:
+            self.tree.insert("", "end", values=(core.to_display_date(t["date_echeance"]), fmt_cfa(t["montant"])))
+            total += t["montant"]
+        ecart = total - self.montant_ttc
+        etat = "✓ correspond au montant TTC" if abs(ecart) < 1 else f"⚠ écart de {fmt_cfa(ecart)}"
+        self.total_var.set(f"Total des tranches : {fmt_cfa(total)} F CFA — {etat}")
+
+    def ajouter_tranche(self):
+        date_str = core.to_iso_date(self.date_var.get().strip())
+        if not date_str:
+            messagebox.showwarning("Champ manquant", "Date d'échéance invalide.", parent=self)
+            return
+        try:
+            montant = float(self.montant_var.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Le montant doit être un nombre.", parent=self)
+            return
+        if montant <= 0:
+            messagebox.showerror("Erreur", "Le montant doit être strictement positif.", parent=self)
+            return
+        self.tranches.append({"date_echeance": date_str, "montant": montant})
+        self.montant_var.set("")
+        self._refresh_tree()
+
+    def retirer_tranche(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+        del self.tranches[idx]
+        self._refresh_tree()
+
+    def enregistrer(self):
+        if not self.tranches:
+            messagebox.showwarning("Vide", "Ajoutez au moins une tranche.", parent=self)
+            return
+        if appeler(self, self.remote, "set_echeancier_commande_client", self.commande_id,
+                   self.tranches) is APPEL_ECHEC:
+            return
+        messagebox.showinfo("Enregistré", "Échéancier planifié sur le serveur.", parent=self)
+        self.on_saved()
+        self.destroy()
+
+
+class RemoteCommandeClientDialog(tk.Toplevel):
+    """Détail d'une Commande client via le réseau — équivalent réseau
+    complet de CommandeClientDialog (bureau). La validation fait basculer
+    la commande en FACTURE DE VENTE (brouillon, non comptabilisée) avec
+    les lignes recopiées."""
+
+    def __init__(self, parent, remote: RemoteConnection, commande_id, on_saved):
+        super().__init__(parent)
+        self.remote = remote
+        self.commande_id = commande_id
+        self.on_saved = on_saved
+        self.selected_ligne_id = None
+        self.title("Commande client")
+        self.geometry("1080x680")
+        self.minsize(850, 500)
+        self.transient(parent)
+        self.grab_set()
+
+        commande = appeler(self, remote, "get_commande_client", commande_id)
+        if commande is APPEL_ECHEC or not commande:
+            self.destroy()
+            return
+        self.validee = commande["statut"] == "validee"
+
+        header = ttk.LabelFrame(self, text="Informations")
+        header.pack(fill="x", padx=10, pady=8)
+        ttk.Label(header, text="N° :").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.numero_var = tk.StringVar(value=commande["numero"])
+        ttk.Entry(header, textvariable=self.numero_var, width=14).grid(row=0, column=1, padx=4)
+        ttk.Label(header, text="Date (JJ/MM/AAAA) :").grid(row=0, column=2, sticky="w", padx=(12, 4))
+        self.date_var = tk.StringVar(value=core.to_display_date(commande["date_commande"]))
+        ttk.Entry(header, textvariable=self.date_var, width=12).grid(row=0, column=3, padx=4)
+        ttk.Label(header, text="Client :").grid(row=0, column=4, sticky="w", padx=(12, 4))
+        self.client_var = tk.StringVar(value=commande["client_code"] or "")
+        self.client_combo = ttk.Combobox(header, textvariable=self.client_var, width=24)
+        self.client_combo.grid(row=0, column=5, padx=4)
+        self.client_combo.bind("<KeyRelease>", self._on_client_keyrelease)
+        self._refresh_client_values()
+
+        ttk.Label(header, text="Paiement attendu :").grid(row=1, column=0, sticky="w", padx=4, pady=(6, 0))
+        self.date_paiement_var = tk.StringVar(value=core.to_display_date(commande.get("date_paiement_attendu") or ""))
+        ttk.Entry(header, textvariable=self.date_paiement_var, width=12).grid(
+            row=1, column=1, padx=4, pady=(6, 0), sticky="w")
+        ttk.Label(header, text="TVA % :").grid(row=1, column=2, sticky="w", padx=(12, 4), pady=(6, 0))
+        self.tva_var = tk.StringVar(value=str(commande.get("tva_taux") or 0))
+        ttk.Entry(header, textvariable=self.tva_var, width=8).grid(row=1, column=3, padx=4, pady=(6, 0), sticky="w")
+        ttk.Label(header, text="Compte TVA :").grid(row=1, column=4, sticky="w", padx=(12, 4), pady=(6, 0))
+        self.tva_compte_var = tk.StringVar(value=commande.get("tva_compte") or core.COMPTE_TVA_VENTES)
+        ttk.Entry(header, textvariable=self.tva_compte_var, width=14).grid(
+            row=1, column=5, padx=4, pady=(6, 0), sticky="w")
+
+        echeancier_frame = ttk.Frame(header)
+        echeancier_frame.grid(row=2, column=0, columnspan=6, sticky="we", padx=4, pady=(6, 0))
+        ttk.Button(echeancier_frame, text="Planifier un échéancier (plusieurs tranches, optionnel)",
+                   command=self.modifier_echeancier).pack(side="left")
+        self.echeancier_apercu_var = tk.StringVar()
+        ttk.Label(echeancier_frame, textvariable=self.echeancier_apercu_var, foreground="#595959").pack(
+            side="left", padx=12)
+        self._refresh_echeancier_apercu()
+
+        origine = "" if not commande.get("facture_vente_id") else \
+            f"Facture générée : n° interne {commande['facture_vente_id']}"
+        self.statut_var = tk.StringVar(
+            value=f"Statut : {'VALIDÉE (facture générée)' if self.validee else 'Brouillon'}   {origine}")
+        ttk.Label(header, textvariable=self.statut_var, font=("Segoe UI", 10, "bold")).grid(
+            row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
+        self.retard_var = tk.StringVar()
+        self.retard_label = ttk.Label(header, textvariable=self.retard_var, font=("Segoe UI", 10, "bold"))
+        self.retard_label.grid(row=3, column=4, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+        self._refresh_retard()
+
+        lignes_frame = ttk.LabelFrame(self, text=(
+            "Lignes — un compte de produit (classe 70x) est OBLIGATOIRE sur chaque ligne pour pouvoir valider"))
+        lignes_frame.pack(fill="both", padx=10, pady=6)
+        form = ttk.Frame(lignes_frame)
+        form.pack(fill="x", padx=6, pady=4)
+        ttk.Label(form, text="Compte de produit (classe 70x) :").grid(row=0, column=0, sticky="w")
+        self.ligne_compte_var = tk.StringVar()
+        self.ligne_compte_combo = ttk.Combobox(form, textvariable=self.ligne_compte_var, width=26)
+        self.ligne_compte_combo.grid(row=0, column=1, padx=4)
+        self.ligne_compte_combo.bind("<KeyRelease>", self._on_ligne_compte_keyrelease)
+        self._refresh_ligne_compte_values()
+        ttk.Label(form, text="Code analytique :").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self.ligne_analytic_var = tk.StringVar()
+        self.ligne_analytic_combo = ttk.Combobox(form, textvariable=self.ligne_analytic_var, width=18)
+        self.ligne_analytic_combo.grid(row=0, column=3, padx=4)
+        self._refresh_ligne_analytic_values()
+
+        ttk.Label(form, text="Libellé :").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.ligne_libelle_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.ligne_libelle_var, width=26).grid(row=1, column=1, padx=4, pady=(4, 0))
+        ttk.Label(form, text="Quantité :").grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(4, 0))
+        self.ligne_qte_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.ligne_qte_var, width=8).grid(row=1, column=3, padx=4, pady=(4, 0), sticky="w")
+        ttk.Label(form, text="Prix unitaire :").grid(row=1, column=4, sticky="w", padx=(12, 0), pady=(4, 0))
+        self.ligne_prix_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.ligne_prix_var, width=10).grid(row=1, column=5, padx=4, pady=(4, 0), sticky="w")
+        ttk.Label(form, text="Unité :").grid(row=1, column=6, sticky="w", padx=(12, 0), pady=(4, 0))
+        self.ligne_unite_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.ligne_unite_var, width=8).grid(row=1, column=7, padx=4, pady=(4, 0))
+
+        btn_row = ttk.Frame(lignes_frame)
+        btn_row.pack(fill="x", padx=6)
+        self.update_ligne_btn = ttk.Button(btn_row, text="Mettre à jour la ligne sélectionnée",
+                                            command=self.update_ligne)
+        self.update_ligne_btn.pack(side="left")
+        self.add_ligne_btn = ttk.Button(btn_row, text="Ajouter une nouvelle ligne", command=self.add_ligne)
+        self.add_ligne_btn.pack(side="left", padx=8)
+        self.delete_ligne_btn = ttk.Button(btn_row, text="Supprimer la ligne sélectionnée", command=self.delete_ligne)
+        self.delete_ligne_btn.pack(side="left", padx=8)
+
+        cols = ("id", "compte", "libelle", "quantite", "prix", "montant", "unite", "analytique")
+        self.tree = ttk.Treeview(lignes_frame, columns=cols, show="headings", height=10)
+        headers = ["ID", "Compte", "Libellé", "Qté", "Prix unit.", "Montant HT", "Unité", "Analytique"]
+        widths = [40, 90, 220, 70, 90, 110, 70, 130]
+        for c, h, w in zip(cols, headers, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.pack(fill="both", padx=6, pady=6)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select_ligne)
+        self.total_var = tk.StringVar()
+        ttk.Label(lignes_frame, textvariable=self.total_var, font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=6, pady=(0, 6))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=10)
+        self.save_btn = ttk.Button(btns, text="Enregistrer", command=self.save)
+        self.save_btn.pack(side="left", padx=4)
+        self.valider_btn = ttk.Button(btns, text="Valider (génère la facture)", command=self.valider)
+        self.valider_btn.pack(side="left", padx=4)
+        self.corriger_btn = ttk.Button(btns, text="Corriger (repasser en brouillon)", command=self.corriger)
+        self.corriger_btn.pack(side="left", padx=4)
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="left", padx=4)
+
+        self.refresh_lignes()
+        self._apply_lock()
+
+    def _appeler(self, fonction, *args, **kwargs):
+        return appeler(self, self.remote, fonction, *args, **kwargs)
+
+    @staticmethod
+    def _extract_code(raw):
+        raw = (raw or "").strip()
+        return raw.split(" — ", 1)[0].strip() if " — " in raw else raw
+
+    def _refresh_client_values(self):
+        items = self._appeler("list_clients")
+        if items is not APPEL_ECHEC:
+            self.client_combo["values"] = [f"{c['code']} — {c['raison_sociale']}" for c in items]
+
+    def _on_client_keyrelease(self, event=None):
+        query = self._extract_code(self.client_var.get())
+        if query:
+            items = self._appeler("list_clients", query)
+            if items is not APPEL_ECHEC:
+                self.client_combo["values"] = [f"{c['code']} — {c['raison_sociale']}" for c in items]
+
+    def _refresh_ligne_compte_values(self):
+        items = self._appeler("search_accounts", "7", limit=100)
+        if items is not APPEL_ECHEC:
+            self.ligne_compte_combo["values"] = [f"{a['code']} — {a['label']}" for a in items if a["classe"] == "7"]
+
+    def _on_ligne_compte_keyrelease(self, event=None):
+        query = self._extract_code(self.ligne_compte_var.get())
+        if query:
+            items = self._appeler("search_accounts", query, limit=50)
+            if items is not APPEL_ECHEC:
+                self.ligne_compte_combo["values"] = [
+                    f"{a['code']} — {a['label']}" for a in items if a["classe"] == "7"]
+
+    def _refresh_ligne_analytic_values(self):
+        codes = self._appeler("list_analytic_codes")
+        if codes is not APPEL_ECHEC:
+            self.ligne_analytic_combo["values"] = [f"{c['code']} — {c['label']}" for c in codes]
+
+    def _apply_lock(self):
+        state = "disabled" if self.validee else "normal"
+        for w in (self.update_ligne_btn, self.add_ligne_btn, self.delete_ligne_btn, self.save_btn, self.valider_btn):
+            w.configure(state=state)
+        self.corriger_btn.configure(state="normal" if self.validee else "disabled")
+
+    def _on_select_ligne(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        v = self.tree.item(sel[0], "values")
+        self.selected_ligne_id = v[0]
+        self.ligne_compte_var.set(v[1])
+        self.ligne_libelle_var.set(v[2])
+        self.ligne_qte_var.set(v[3])
+        self.ligne_prix_var.set(v[4])
+        self.ligne_unite_var.set(v[6])
+        self.ligne_analytic_var.set(v[7])
+
+    def _clear_ligne_form(self):
+        self.selected_ligne_id = None
+        self.ligne_compte_var.set(""); self.ligne_libelle_var.set("")
+        self.ligne_qte_var.set(""); self.ligne_prix_var.set("")
+        self.ligne_unite_var.set(""); self.ligne_analytic_var.set("")
+
+    def refresh_lignes(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        lignes = self._appeler("list_lignes_commande_client", self.commande_id)
+        if lignes is APPEL_ECHEC:
+            return
+        total = 0.0
+        for l in lignes:
+            total += l["montant_ht"]
+            self.tree.insert("", "end", values=(
+                l["id"], l["compte_vente"] or "⚠ à choisir", l["libelle"], f"{l['quantite']:g}",
+                f"{fmt_cfa(l['prix_unitaire'])}", f"{fmt_cfa(l['montant_ht'])}", l["unite"] or "",
+                l["analytic_code"] or ""))
+        self.total_var.set(f"Total HT : {fmt_cfa(total)}")
+
+    def add_ligne(self):
+        libelle = self.ligne_libelle_var.get().strip()
+        if not libelle:
+            messagebox.showwarning("Champ manquant", "Le libellé est obligatoire.", parent=self)
+            return
+        try:
+            qte = float(self.ligne_qte_var.get() or 0)
+            prix = float(self.ligne_prix_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Quantité et Prix unitaire doivent être des nombres.", parent=self)
+            return
+        compte = self._extract_code(self.ligne_compte_var.get()) or None
+        analytic = self._extract_code(self.ligne_analytic_var.get()) or None
+        if self._appeler("add_ligne_commande_client", self.commande_id, libelle, qte, prix_unitaire=prix,
+                          unite=self.ligne_unite_var.get().strip() or None,
+                          compte_vente=compte, analytic_code=analytic) is APPEL_ECHEC:
+            return
+        self._clear_ligne_form()
+        self.refresh_lignes()
+
+    def update_ligne(self):
+        if not self.selected_ligne_id:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une ligne dans le tableau.", parent=self)
+            return
+        libelle = self.ligne_libelle_var.get().strip()
+        if not libelle:
+            messagebox.showwarning("Champ manquant", "Le libellé est obligatoire.", parent=self)
+            return
+        try:
+            qte = float(self.ligne_qte_var.get() or 0)
+            prix = float(self.ligne_prix_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Quantité et Prix unitaire doivent être des nombres.", parent=self)
+            return
+        compte = self._extract_code(self.ligne_compte_var.get()) or None
+        analytic = self._extract_code(self.ligne_analytic_var.get()) or None
+        if self._appeler(
+            "update_ligne_commande_client", self.selected_ligne_id, libelle=libelle, quantite=qte,
+            prix_unitaire=prix, unite=self.ligne_unite_var.get().strip() or None,
+            compte_vente=compte, analytic_code=analytic
+        ) is APPEL_ECHEC:
+            return
+        self._clear_ligne_form()
+        self.refresh_lignes()
+
+    def delete_ligne(self):
+        if not self.selected_ligne_id:
+            messagebox.showinfo("Info", "Sélectionnez d'abord une ligne.", parent=self)
+            return
+        if self._appeler("delete_ligne_commande_client", self.selected_ligne_id) is APPEL_ECHEC:
+            return
+        self._clear_ligne_form()
+        self.refresh_lignes()
+
+    def _refresh_retard(self):
+        commandes = self._appeler("list_commandes_client")
+        if commandes is APPEL_ECHEC:
+            return
+        match = next((c for c in commandes if c["id"] == self.commande_id), None)
+        if not match or not match.get("statut_paiement"):
+            self.retard_var.set("")
+            return
+        self.retard_var.set(f"Paiement : {match['statut_paiement']}")
+        self.retard_label.configure(foreground="#B00020" if match["depassement_paiement"] else "#1F7A1F")
+
+    def _refresh_echeancier_apercu(self):
+        tranches = self._appeler("list_echeances_commande_client", self.commande_id)
+        if tranches is APPEL_ECHEC:
+            return
+        if not tranches:
+            self.echeancier_apercu_var.set("Aucun échéancier planifié (paiement en une fois à la date ci-dessus).")
+        else:
+            self.echeancier_apercu_var.set(
+                f"{len(tranches)} tranche(s) planifiée(s) : " +
+                ", ".join(f"{core.to_display_date(t['date_echeance'])} ({fmt_cfa(t['montant'])})" for t in tranches))
+
+    def modifier_echeancier(self):
+        totals = self._appeler("compute_commande_client_totals", self.commande_id)
+        if totals is APPEL_ECHEC:
+            return
+        if totals["total_ttc"] <= 0:
+            messagebox.showinfo("Info", "Ajoutez d'abord des lignes avec un montant avant de planifier "
+                                         "un échéancier.", parent=self)
+            return
+        RemoteCommandeClientEcheancierDialog(self, self.remote, self.commande_id, totals["total_ttc"],
+                                              self._refresh_echeancier_apercu)
+
+    def save(self):
+        date_str = core.to_iso_date(self.date_var.get().strip())
+        try:
+            tva = float(self.tva_var.get() or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Le taux de TVA doit être un nombre.", parent=self)
+            return
+        if self._appeler(
+            "update_commande_client", self.commande_id,
+            numero=self.numero_var.get().strip(), date_commande=date_str,
+            client_code=self._extract_code(self.client_var.get()),
+            date_paiement_attendu=core.to_iso_date(self.date_paiement_var.get().strip()) or None,
+            tva_taux=tva, tva_compte=self.tva_compte_var.get().strip() or core.COMPTE_TVA_VENTES,
+        ) is APPEL_ECHEC:
+            return
+        self._refresh_retard()
+        messagebox.showinfo("Enregistré", "Commande enregistrée sur le serveur.", parent=self)
+        self.on_saved()
+
+    def valider(self):
+        if not messagebox.askyesno(
+            "Valider cette commande",
+            "Cette commande va être verrouillée et va générer une FACTURE DE VENTE (brouillon, non "
+            "comptabilisée) avec les lignes recopiées. Aucune écriture comptable n'est envoyée à ce "
+            "stade — c'est la validation de cette facture, avec sa date de règlement prévu (menu "
+            "COMMERCIAL > Facturation), qui comptabilisera la vente et l'enverra dans Recouvrement."
+            "\n\nContinuer ?",
+            parent=self,
+        ):
+            return
+        self.save()
+        r = self._appeler("valider_commande_client", self.commande_id)
+        if r is APPEL_ECHEC:
+            return
+        messagebox.showinfo(
+            "Validée",
+            "Commande validée — une facture de vente brouillon a été créée dans COMMERCIAL > Facturation. "
+            "Complétez-la si besoin puis validez-la avec sa date de règlement prévu pour comptabiliser "
+            "la vente et l'envoyer dans Recouvrement.",
+            parent=self,
+        )
+        self.on_saved()
+        self.destroy()
+
+    def corriger(self):
+        if not messagebox.askyesno(
+            "Corriger cette commande",
+            "Cette commande est déjà validée : elle va repasser en brouillon modifiable (impossible si "
+            "la facture générée est elle-même déjà validée — corrigez-la d'abord).\n\nContinuer ?",
+            parent=self,
+        ):
+            return
+        r = self._appeler("devalider_commande_client", self.commande_id)
+        if r is APPEL_ECHEC:
+            return
+        self.validee = False
+        self.statut_var.set("Statut : Brouillon")
+        self._apply_lock()
+        self.refresh_lignes()
+        messagebox.showinfo("Repassée en brouillon",
+                             "La commande est de nouveau modifiable. Corrigez les lignes puis cliquez "
+                             "sur « Valider ».", parent=self)
+        self.on_saved()
+
+
+class RemoteCommandeClientTab(ttk.Frame):
+    """Liste des Commandes client via le réseau (menu COMMERCIAL) —
+    équivalent réseau complet de CommandeClientTab (bureau)."""
+
+    def __init__(self, parent, remote: RemoteConnection):
+        super().__init__(parent)
+        self.remote = remote
+        ttk.Label(self, text="COMMANDES CLIENT", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(self, text=(
+            "Enregistrez ici les commandes reçues d'un client. Une commande validée génère une facture "
+            "de vente (brouillon) — c'est la validation de CETTE facture (COMMERCIAL > Facturation) qui "
+            "comptabilise la vente et l'envoie dans Recouvrement. Cliquez sur une ligne pour l'ouvrir."
+        ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
+
+        btn_bar = ttk.Frame(self)
+        btn_bar.pack(fill="x", padx=16, pady=4)
+        ttk.Button(btn_bar, text="Nouvelle commande", command=self.new_commande).pack(side="left")
+        ttk.Button(btn_bar, text="Actualiser", command=self.refresh).pack(side="left", padx=8)
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=16, pady=8)
+        cols = ("numero", "date", "client", "nb_lignes", "statut", "paiement_attendu", "statut_paiement")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        headers = ["N°", "Date", "Client", "Lignes", "Statut", "Paiement attendu", "Statut paiement"]
+        widths = [110, 100, 220, 60, 130, 130, 160]
+        for c, h, w in zip(cols, headers, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.tag_configure("retard", foreground="#B00020", font=("Segoe UI", 9, "bold"))
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.bind("<Button-1>", self._on_click)
+        self._by_iid = {}
+        self.refresh()
+
+    def _appeler(self, fonction, *args, **kwargs):
+        return appeler(self, self.remote, fonction, *args, **kwargs)
+
+    def new_commande(self):
+        numero = simpledialog.askstring("Nouvelle commande client", "N° :", parent=self)
+        if not numero:
+            return
+        cid = self._appeler("create_commande_client", numero, date.today().strftime("%Y-%m-%d"))
+        if cid is APPEL_ECHEC:
+            return
+        self.refresh()
+        RemoteCommandeClientDialog(self, self.remote, cid, on_saved=self.refresh)
+
+    def _on_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        cid = self._by_iid.get(iid)
+        if cid:
+            RemoteCommandeClientDialog(self, self.remote, cid, on_saved=self.refresh)
+
+    def refresh(self):
+        commandes = self._appeler("list_commandes_client")
+        if commandes is APPEL_ECHEC:
+            return
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        self._by_iid = {}
+        for commande in commandes:
+            nb_result = self._appeler("list_lignes_commande_client", commande["id"])
+            nb = len(nb_result) if nb_result is not APPEL_ECHEC else 0
+            statut = "Validée" if commande["statut"] == "validee" else "Brouillon"
+            tags = ("retard",) if commande.get("depassement_paiement") else ()
+            iid = self.tree.insert("", "end", tags=tags, values=(
+                commande["numero"], core.to_display_date(commande["date_commande"]),
+                commande.get("raison_sociale") or commande.get("client_code") or "", nb, statut,
+                core.to_display_date(commande.get("date_paiement_attendu") or ""),
+                commande.get("statut_paiement") or "",
+            ))
+            self._by_iid[iid] = commande["id"]
 
 
 class RemoteFactureVenteEcheancierDialog(tk.Toplevel):
