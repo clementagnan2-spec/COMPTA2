@@ -52,7 +52,7 @@ import core
 # Permet de vérifier en un coup d'œil (affiché au démarrage ET dans
 # /ping) que le serveur en cours d'exécution est bien la dernière
 # version, sans avoir à deviner.
-SERVER_VERSION = "2026-08-27-v22"
+SERVER_VERSION = "2026-08-27-v24"
 
 # ---------------------------------------------------------------------------
 # SÉCURITÉ — modèle en LISTE NOIRE (pas liste blanche) : toute fonction
@@ -111,6 +111,11 @@ def _construire_rpc_whitelist():
 
 
 RPC_WHITELIST = _construire_rpc_whitelist()
+
+# Fonctions pures (sans `conn`) explicitement autorisées à distance malgré
+# l'absence du premier paramètre `conn` — ex. calculs sans accès base.
+RPC_EXTRA_WHITELIST = {"compute_bulletin_paie"}
+RPC_WHITELIST |= RPC_EXTRA_WHITELIST
 
 SESSION_DURATION_SECONDS = 8 * 3600  # 8h de travail avant reconnexion
 
@@ -177,6 +182,9 @@ class AccountingServer:
             # de bureau) a bien validé des changements depuis. Sans effet si
             # rien n'était en attente (commit() est alors un no-op).
             self.conn.commit()
+            if function_name in RPC_EXTRA_WHITELIST:
+                # Fonction pure sans `conn` (voir RPC_EXTRA_WHITELIST) — pas d'injection.
+                return fn(*args, **kwargs)
             return fn(self.conn, *args, **kwargs)
 
 

@@ -10971,7 +10971,13 @@ def compute_echeances_tresorerie_pivot(conn, date_from=None, nb_mois=6):
 
     lignes_pivot = sorted(groupes.values(), key=lambda g: (g["type"], g["tiers"]))
     totaux_colonnes = [sum(l["montants"][i] for l in lignes_pivot) for i in range(nb_mois + 1)]
+    lignes_produits = [l for l in lignes_pivot if l["type"] == "Client"]
+    lignes_charges = [l for l in lignes_pivot if l["type"] != "Client"]
+    sous_total_produits = [sum(l["montants"][i] for l in lignes_produits) for i in range(nb_mois + 1)]
+    sous_total_charges = [sum(l["montants"][i] for l in lignes_charges) for i in range(nb_mois + 1)]
     return {"colonnes": colonnes, "lignes": lignes_pivot, "totaux_colonnes": totaux_colonnes,
+            "sous_total_produits": sous_total_produits, "sous_total_charges": sous_total_charges,
+            "total_produits": sum(sous_total_produits), "total_charges": sum(sous_total_charges),
             "total_general": sum(totaux_colonnes)}
 
 

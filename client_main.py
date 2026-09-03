@@ -1557,11 +1557,38 @@ class RemotePaieBulletinsTab(ttk.Frame):
             w.grid(row=i, column=1, pady=2, sticky="w")
             self.form_vars[key] = var
 
+        retenues_frame = ttk.LabelFrame(right, text="Retenues et charges (calculées)")
+        retenues_frame.pack(fill="x", pady=(12, 8))
+        self.retenues_vars = {}
+        retenues_labels = [
+            ("cnss_salariale", "CNSS (salariale)"),
+            ("iuts_net", "IUTS"),
+            ("retenue_obligatoire", "Retenue obligatoire 1%"),
+            ("retenue_pret", "Retenue prêt/avance"),
+            ("net_percu", "NET PERÇU"),
+            ("tpa_patronale", "TAP (charge patronale)"),
+            ("cnss_patronale", "CNSS (charge patronale)"),
+            ("cout_total_employeur", "Coût total employeur"),
+        ]
+        for i, (key, label) in enumerate(retenues_labels):
+            ttk.Label(retenues_frame, text=label + " :").grid(row=i, column=0, sticky="w", padx=4, pady=1)
+            var = tk.StringVar(value="—")
+            bold = key in ("net_percu", "cout_total_employeur")
+            ttk.Label(retenues_frame, textvariable=var,
+                      font=("Segoe UI", 9, "bold" if bold else "normal")).grid(
+                row=i, column=1, sticky="e", padx=4, pady=1)
+            self.retenues_vars[key] = var
+        ttk.Button(retenues_frame, text="Calculer (aperçu, sans enregistrer)",
+                   command=self._calculer_retenues).grid(row=len(retenues_labels), column=0, columnspan=2,
+                                                           pady=(6, 4))
+
         btns = ttk.Frame(right)
         btns.pack(pady=12)
         ttk.Button(btns, text="Enregistrer le bulletin", command=self.save_bulletin).grid(row=0, column=0, padx=2)
         ttk.Button(btns, text="Supprimer", command=self.delete_bulletin).grid(row=0, column=1, padx=2)
         ttk.Button(right, text="Vider le formulaire", command=self.clear_form).pack()
+        ttk.Button(right, text="📄 Aperçu / Imprimer le bulletin (PDF)",
+                   command=self.imprimer_bulletin).pack(pady=(8, 0))
 
         self.refresh()
 
@@ -1586,6 +1613,44 @@ class RemotePaieBulletinsTab(ttk.Frame):
         self.employe_var.set("")
         for key, _, kind in self.CHAMPS:
             self.form_vars[key].set("AUTRE" if kind == "combo" else "0")
+        for var in self.retenues_vars.values():
+            var.set("—")
+
+    def _calculer_retenues(self):
+        try:
+            bulletin = {}
+            for key, _, kind in self.CHAMPS:
+                if kind == "combo":
+                    bulletin[key] = self.form_vars[key].get()
+                elif key == "personnes_a_charge":
+                    bulletin[key] = int(float(self.form_vars[key].get() or 0))
+                else:
+                    bulletin[key] = float(self.form_vars[key].get() or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Merci de vérifier les valeurs numériques saisies.", parent=self)
+            return
+        params = self._appeler("get_paie_parametres")
+        if params is APPEL_ECHEC:
+            return
+        resultat = self._appeler("compute_bulletin_paie", bulletin, params)
+        if resultat is APPEL_ECHEC:
+            return
+        for key, var in self.retenues_vars.items():
+            var.set(fmt_cfa(resultat.get(key, 0)))
+
+    def imprimer_bulletin(self):
+        if not self.selected_bulletin_id:
+            messagebox.showinfo("Info", "Sélectionnez (ou enregistrez) d'abord un bulletin dans le tableau.",
+                                 parent=self)
+            return
+        html = self._appeler("render_bulletin_paie_html", self.selected_bulletin_id)
+        if html is APPEL_ECHEC:
+            return
+        import tempfile, webbrowser, os as _os
+        path = _os.path.join(tempfile.gettempdir(), f"bulletin_paie_{self.selected_bulletin_id}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+        webbrowser.open(f"file://{path}")
 
     def _on_select(self, event=None):
         sel = self.tree.selection()
@@ -1605,6 +1670,7 @@ class RemotePaieBulletinsTab(ttk.Frame):
         self.employe_var.set(label)
         for key, _, _ in self.CHAMPS:
             self.form_vars[key].set(str(b.get(key, 0)))
+        self._calculer_retenues()
 
     def save_bulletin(self):
         label = self.employe_var.get().strip()
@@ -1631,7 +1697,11 @@ class RemotePaieBulletinsTab(ttk.Frame):
             return
         if self._appeler("set_bulletin_paie", p["id"], periode, **champs) is APPEL_ECHEC:
             return
+        b = self._appeler("get_bulletin_paie", p["id"], periode)
+        if b is not APPEL_ECHEC and b:
+            self.selected_bulletin_id = b["id"]
         self.refresh()
+        self._calculer_retenues()
         messagebox.showinfo("Enregistré", "Bulletin de paie enregistré.", parent=self)
 
     def delete_bulletin(self):
@@ -4496,6 +4566,7 @@ class RemoteTresorerieTab(ttk.Frame):
         ttk.Label(parent, textvariable=self.echeances_synthese_var, font=("Segoe UI", 11, "bold")).pack(
             anchor="w", padx=8, pady=8)
         self.tree_echeances = ttk.Treeview(parent, show="headings", height=14)
+        self.tree_echeances.tag_configure("sous_total", background="#DCE6F1", font=("Segoe UI", 9, "bold"))
         self.tree_echeances.tag_configure("total", background="#1F4E78", foreground="white",
                                            font=("Segoe UI", 10, "bold"))
         self.tree_echeances.pack(fill="both", expand=True, padx=8, pady=8)
@@ -4555,6 +4626,12 @@ class RemoteTresorerieTab(ttk.Frame):
             self.tree_echeances.insert("", "end", values=(
                 l["type"], l["tiers"], l["piece"], l["compte_charge"],
                 *[fmt_cfa(m) if m else "" for m in l["montants"]], fmt_cfa(l["total"])))
+        self.tree_echeances.insert("", "end", tags=("sous_total",), values=(
+            "SOUS-TOTAL PRODUITS (CLIENTS)", "", "", "",
+            *[fmt_cfa(t) for t in p["sous_total_produits"]], fmt_cfa(p["total_produits"])))
+        self.tree_echeances.insert("", "end", tags=("sous_total",), values=(
+            "SOUS-TOTAL CHARGES (FOURNISSEURS)", "", "", "",
+            *[fmt_cfa(t) for t in p["sous_total_charges"]], fmt_cfa(p["total_charges"])))
         self.tree_echeances.insert("", "end", tags=("total",), values=(
             "TOTAL", "", "", "", *[fmt_cfa(t) for t in p["totaux_colonnes"]], fmt_cfa(p["total_general"])))
         self.echeances_synthese_var.set(
