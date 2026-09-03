@@ -2155,7 +2155,7 @@ class RemoteArreteComptesTab(ttk.Frame):
 
         self.tab_clients = self._make_tab_tree(
             "Clients",
-            "Balance âgée des impayés clients (voir COMMERCIAL > Recouvrement pour le détail par tranche).",
+            "Balance âgée des impayés clients (voir COMMERCIAL > Paiement/Recouvrement pour le détail par tranche).",
             ("client", "total"), ["Client", "Total impayé"], [300, 150])
 
         self.tab_banques = self._make_tab_tree(
@@ -3624,7 +3624,7 @@ class RemoteCommandeClientDialog(tk.Toplevel):
             "Cette commande va être verrouillée et va générer une FACTURE DE VENTE (brouillon, non "
             "comptabilisée) avec les lignes recopiées. Aucune écriture comptable n'est envoyée à ce "
             "stade — c'est la validation de cette facture, avec sa date de règlement prévu (menu "
-            "COMMERCIAL > Facturation), qui comptabilisera la vente et l'enverra dans Recouvrement."
+            "COMMERCIAL > Facturation), qui comptabilisera la vente et l'enverra dans Paiement/Recouvrement."
             "\n\nContinuer ?",
             parent=self,
         ):
@@ -3637,7 +3637,7 @@ class RemoteCommandeClientDialog(tk.Toplevel):
             "Validée",
             "Commande validée — une facture de vente brouillon a été créée dans COMMERCIAL > Facturation. "
             "Complétez-la si besoin puis validez-la avec sa date de règlement prévu pour comptabiliser "
-            "la vente et l'envoyer dans Recouvrement.",
+            "la vente et l'envoyer dans Paiement/Recouvrement.",
             parent=self,
         )
         self.on_saved()
@@ -3676,7 +3676,7 @@ class RemoteCommandeClientTab(ttk.Frame):
         ttk.Label(self, text=(
             "Enregistrez ici les commandes reçues d'un client. Une commande validée génère une facture "
             "de vente (brouillon) — c'est la validation de CETTE facture (COMMERCIAL > Facturation) qui "
-            "comptabilise la vente et l'envoie dans Recouvrement. Cliquez sur une ligne pour l'ouvrir."
+            "comptabilise la vente et l'envoie dans Paiement/Recouvrement. Cliquez sur une ligne pour l'ouvrir."
         ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
 
         btn_bar = ttk.Frame(self)
@@ -3882,7 +3882,7 @@ class RemoteFacturationTab(ttk.Frame):
             row=1, column=2, sticky="w", padx=4, pady=(6, 0))
         ttk.Label(header, text=(
             "Obligatoire pour valider — dès qu'elle est renseignée, la facture est comptabilisée et "
-            "devient visible dans COMMERCIAL > Recouvrement."
+            "devient visible dans COMMERCIAL > Paiement/Recouvrement."
         ), foreground="#595959", wraplength=650).grid(row=1, column=3, columnspan=4, sticky="w", padx=4, pady=(6, 0))
         echeancier_frame = ttk.Frame(header)
         echeancier_frame.grid(row=2, column=0, columnspan=7, sticky="we", padx=4, pady=(6, 0))
@@ -4019,11 +4019,11 @@ class RemoteFacturationTab(ttk.Frame):
             messagebox.showwarning(
                 "Date manquante",
                 "Renseignez la date de règlement prévu avant de valider — c'est elle qui déclenche la "
-                "comptabilisation et la visibilité dans Recouvrement.", parent=self)
+                "comptabilisation et la visibilité dans Paiement/Recouvrement.", parent=self)
             return
         if not messagebox.askyesno("Valider cette facture",
                                     "La facture va être comptabilisée sur le serveur (débit client, crédit "
-                                    "vente + TVA), et apparaîtra dans COMMERCIAL > Recouvrement avec son "
+                                    "vente + TVA), et apparaîtra dans COMMERCIAL > Paiement/Recouvrement avec son "
                                     "échéancier. Continuer ?", parent=self):
             return
         r = self._appeler("valider_facture_vente", self.facture_id_selectionnee,
@@ -5102,7 +5102,7 @@ class RemoteFacturesRecouvrementTab(ttk.Frame):
         self.remote = remote
         self.selected_id = None
 
-        ttk.Label(self, text="RECOUVREMENT — SUIVI DES RETARDS DE PAIEMENT CLIENTS",
+        ttk.Label(self, text="PAIEMENT/RECOUVREMENT — SUIVI DES RETARDS DE PAIEMENT CLIENTS",
                   font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
         ttk.Label(self, text=(
             "Enregistrez ici chaque facture émise à un client. L'échéance de paiement est calculée "

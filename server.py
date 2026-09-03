@@ -52,7 +52,7 @@ import core
 # Permet de vérifier en un coup d'œil (affiché au démarrage ET dans
 # /ping) que le serveur en cours d'exécution est bien la dernière
 # version, sans avoir à deviner.
-SERVER_VERSION = "2026-08-27-v18"
+SERVER_VERSION = "2026-08-27-v19"
 
 # ---------------------------------------------------------------------------
 # SÉCURITÉ — modèle en LISTE NOIRE (pas liste blanche) : toute fonction

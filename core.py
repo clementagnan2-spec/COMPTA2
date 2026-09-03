@@ -9657,7 +9657,7 @@ def synchroniser_base(conn):
 # ---------------------------------------------------------------------------
 MENU_STRUCTURE = [
     ("SAISIE", [("Saisie des écritures", "saisie"), ("Soldes d'ouverture", "ouverture")]),
-    ("COMMERCIAL", [("Clients", "clients"), ("Recouvrement", "recouvrement"), ("Commandes", "commandes_client"),
+    ("COMMERCIAL", [("Clients", "clients"), ("Paiement/Recouvrement", "recouvrement"), ("Commandes", "commandes_client"),
                   ("Facturation", "facturation"),
                   ("Stocks", "stocks"), ("Marges bénéficiaires", "marges")]),
     ("PRODUCTION", [("Matières premières", "stocks"), ("Fabrication", "production"),

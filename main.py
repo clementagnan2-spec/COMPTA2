@@ -272,7 +272,7 @@ class App(tk.Tk):
         ])
         add_top_menu("COMMERCIAL", [
             ("Clients", "clients"),
-            ("Recouvrement", "recouvrement"),
+            ("Paiement/Recouvrement", "recouvrement"),
             ("Commandes", "commandes_client"),
             ("Facturation", "facturation"),
             ("Stocks", "stocks"),
@@ -4523,7 +4523,7 @@ class ArreteComptesTab(ttk.Frame):
 
         self.tab_clients = self._make_tab_tree(
             "Clients",
-            "Balance âgée des impayés clients (voir COMMERCIAL > Recouvrement pour le détail par tranche).",
+            "Balance âgée des impayés clients (voir COMMERCIAL > Paiement/Recouvrement pour le détail par tranche).",
             ("client", "total"), ["Client", "Total impayé"], [300, 150])
 
         self.tab_banques = self._make_tab_tree(
@@ -7000,7 +7000,7 @@ class CommandeClientDialog(tk.Toplevel):
             "Cette commande va être verrouillée et va générer une FACTURE DE VENTE (brouillon, non "
             "comptabilisée) avec les lignes recopiées. Aucune écriture comptable n'est envoyée à ce "
             "stade — c'est la validation de cette facture, avec sa date de règlement prévu (menu "
-            "COMMERCIAL > Facturation), qui comptabilisera la vente et l'enverra dans Recouvrement."
+            "COMMERCIAL > Facturation), qui comptabilisera la vente et l'enverra dans Paiement/Recouvrement."
             "\n\nContinuer ?",
             parent=self,
         ):
@@ -7015,7 +7015,7 @@ class CommandeClientDialog(tk.Toplevel):
             "Validée",
             "Commande validée — une facture de vente brouillon a été créée dans COMMERCIAL > Facturation. "
             "Complétez-la si besoin puis validez-la avec sa date de règlement prévu pour comptabiliser "
-            "la vente et l'envoyer dans Recouvrement.",
+            "la vente et l'envoyer dans Paiement/Recouvrement.",
             parent=self,
         )
         self.on_saved()
@@ -7057,7 +7057,7 @@ class CommandeClientTab(ttk.Frame):
         ttk.Label(self, text=(
             "Enregistrez ici les commandes reçues d'un client. Une commande validée génère une facture "
             "de vente (brouillon) — c'est la validation de CETTE facture (COMMERCIAL > Facturation) qui "
-            "comptabilise la vente et l'envoie dans Recouvrement. Cliquez sur une ligne pour l'ouvrir."
+            "comptabilise la vente et l'envoie dans Paiement/Recouvrement. Cliquez sur une ligne pour l'ouvrir."
         ), foreground="#595959", wraplength=1100).pack(anchor="w", padx=16, pady=(0, 8))
 
         btn_bar = ttk.Frame(self)
@@ -7235,14 +7235,10 @@ class FacturationTab(ttk.Frame):
         self.conn = conn
         self.current_facture_id = None
 
-        # ---- Barre du haut : liste des factures ----
+        # ---- Barre du haut ----
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=8)
-        ttk.Label(top, text="Facture n° :").pack(side="left")
-        self.facture_combo = ttk.Combobox(top, width=40, state="readonly")
-        self.facture_combo.pack(side="left", padx=4)
-        self.facture_combo.bind("<<ComboboxSelected>>", self._on_facture_selected)
-        ttk.Button(top, text="Nouvelle facture", command=self.new_facture).pack(side="left", padx=8)
+        ttk.Button(top, text="Nouvelle facture", command=self.new_facture).pack(side="left", padx=2)
         ttk.Button(top, text="Supprimer cette facture", command=self.delete_facture).pack(side="left", padx=2)
         self.corriger_btn = ttk.Button(top, text="Corriger cette facture (erreur sur les chiffres)",
                                         command=self.corriger_facture)
@@ -7251,13 +7247,18 @@ class FacturationTab(ttk.Frame):
         self.statut_var = tk.StringVar()
         ttk.Label(top, textvariable=self.statut_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=16)
 
-        # ---- Entête modifiable ----
-        ttk.Label(self, text="En-tête de la facture (modifiable) :").pack(anchor="w", padx=12)
-        self.entete_text = tk.Text(self, height=3, font=("Segoe UI", 10))
-        self.entete_text.pack(fill="x", padx=12, pady=(0, 8))
-
-        # ---- Champs d'en-tête structurés ----
-        info = ttk.Frame(self)
+        ttk.Label(self, text="Factures établies — cliquez une ligne pour la charger ci-dessous :").pack(
+            anchor="w", padx=12)
+        cols_liste = ("id", "numero", "client", "date", "statut", "total_ttc")
+        self.tree_factures = ttk.Treeview(self, columns=cols_liste, show="headings", height=5)
+        headers_liste = ["ID", "Numéro", "Client", "Date", "Statut", "Total TTC"]
+        for c, h, w in zip(cols_liste, headers_liste, [0, 100, 240, 90, 100, 120]):
+            self.tree_factures.heading(c, text=h)
+            self.tree_factures.column(c, width=w, anchor="w", stretch=(c != "id"))
+        self.tree_factures.column("id", width=0, stretch=False)
+        self.tree_factures["displaycolumns"] = ("numero", "client", "date", "statut", "total_ttc")
+        self.tree_factures.pack(fill="x", padx=12, pady=(2, 8))
+        self.tree_factures.bind("<<TreeviewSelect>>", self._on_facture_selected)
         info.pack(fill="x", padx=12, pady=4)
         ttk.Label(info, text="N° Facture :").grid(row=0, column=0, sticky="w", padx=4)
         self.numero_var = tk.StringVar()
@@ -7291,7 +7292,7 @@ class FacturationTab(ttk.Frame):
             row=2, column=2, sticky="w", padx=4, pady=(6, 0))
         ttk.Label(info, text=(
             "Obligatoire pour valider — dès qu'elle est renseignée, la facture est comptabilisée et "
-            "devient visible dans COMMERCIAL > Recouvrement."
+            "devient visible dans COMMERCIAL > Paiement/Recouvrement."
         ), foreground="#595959", wraplength=650).grid(row=2, column=3, columnspan=4, sticky="w", padx=4, pady=(6, 0))
         echeancier_frame = ttk.Frame(info)
         echeancier_frame.grid(row=3, column=0, columnspan=8, sticky="we", padx=4, pady=(6, 0))
@@ -7341,10 +7342,19 @@ class FacturationTab(ttk.Frame):
         self.totals_var = tk.StringVar()
         ttk.Label(self, textvariable=self.totals_var, font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(8, 0))
 
-        # ---- Pied de page modifiable ----
-        ttk.Label(self, text="Pied de page de la facture (modifiable) :").pack(anchor="w", padx=12, pady=(8, 0))
-        self.pied_text = tk.Text(self, height=3, font=("Segoe UI", 10))
-        self.pied_text.pack(fill="x", padx=12, pady=(0, 8))
+        # ---- En-tête / Pied de page modifiables ----
+        docs_frame = ttk.Frame(self)
+        docs_frame.pack(fill="x", padx=12, pady=(8, 0))
+        entete_col = ttk.Frame(docs_frame)
+        entete_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Label(entete_col, text="En-tête de la facture (modifiable, pour l'impression) :").pack(anchor="w")
+        self.entete_text = tk.Text(entete_col, height=2, font=("Segoe UI", 10))
+        self.entete_text.pack(fill="x", pady=(0, 8))
+        pied_col = ttk.Frame(docs_frame)
+        pied_col.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Label(pied_col, text="Pied de page de la facture (modifiable) :").pack(anchor="w")
+        self.pied_text = tk.Text(pied_col, height=2, font=("Segoe UI", 10))
+        self.pied_text.pack(fill="x", pady=(0, 8))
 
         # ---- Validation ----
         btns = ttk.Frame(self)
@@ -7394,12 +7404,22 @@ class FacturationTab(ttk.Frame):
     # -- Gestion des factures --
     def refresh_factures_list(self):
         factures = core.list_factures_vente(self.conn)
-        values = [f"{f['numero']} — {f['raison_sociale']} — {f['statut']}" for f in factures]
-        self.facture_combo["values"] = values
         self._factures_cache = factures
+        for row in self.tree_factures.get_children():
+            self.tree_factures.delete(row)
+        for f in factures:
+            totals = core.compute_facture_totals(self.conn, f["id"])
+            self.tree_factures.insert("", "end", iid=str(f["id"]), values=(
+                f["id"], f["numero"], f["raison_sociale"], core.to_display_date(f["date_facture"]),
+                f["statut"], fmt_cfa(totals["total_ttc"])))
         if self.current_facture_id is None and factures:
             self.current_facture_id = factures[0]["id"]
-            self.facture_combo.current(0)
+            self.tree_factures.selection_set(str(self.current_facture_id))
+        elif self.current_facture_id is not None:
+            try:
+                self.tree_factures.selection_set(str(self.current_facture_id))
+            except tk.TclError:
+                pass
         self.load_facture()
 
     def new_facture(self):
@@ -7417,9 +7437,10 @@ class FacturationTab(ttk.Frame):
         self.refresh_factures_list()
 
     def _on_facture_selected(self, event=None):
-        idx = self.facture_combo.current()
-        if 0 <= idx < len(self._factures_cache):
-            self.current_facture_id = self._factures_cache[idx]["id"]
+        sel = self.tree_factures.selection()
+        if not sel:
+            return
+        self.current_facture_id = int(sel[0])
         self.load_facture()
 
     def load_facture(self):
@@ -7587,13 +7608,13 @@ class FacturationTab(ttk.Frame):
             messagebox.showwarning(
                 "Date manquante",
                 "Renseignez la date de règlement prévu avant de valider — c'est elle qui déclenche la "
-                "comptabilisation et la visibilité dans COMMERCIAL > Recouvrement.")
+                "comptabilisation et la visibilité dans COMMERCIAL > Paiement/Recouvrement.")
             return
         if messagebox.askyesno(
             "Confirmer la validation",
             "Valider cette facture ? Les écritures comptables seront envoyées dans le menu SAISIE "
             "(débit client, crédit ventes, TVA, et sortie de stock automatique pour les lignes "
-            "marchandises/produits finis), et la facture apparaîtra dans COMMERCIAL > Recouvrement "
+            "marchandises/produits finis), et la facture apparaîtra dans COMMERCIAL > Paiement/Recouvrement "
             "avec son échéancier. Cette action est définitive."
         ):
             try:
@@ -7684,7 +7705,7 @@ class FacturationTab(ttk.Frame):
 
 class RecouvrementPaiementDialog(tk.Toplevel):
     """Paiement d'une facture client selon son échéancier — ouvert en
-    cliquant une ligne dans COMMERCIAL > Recouvrement. Chaque tranche se
+    cliquant une ligne dans COMMERCIAL > Paiement/Recouvrement. Chaque tranche se
     paie individuellement (sa propre banque, sa propre date), exactement
     comme pour les règlements fournisseurs."""
 
@@ -7923,7 +7944,7 @@ class RecouvrementTab(ttk.Frame):
         self.refresh()
 
     def _build_factures(self, parent):
-        ttk.Label(parent, text="RECOUVREMENT — SUIVI DES RETARDS DE PAIEMENT CLIENTS",
+        ttk.Label(parent, text="PAIEMENT/RECOUVREMENT — SUIVI DES RETARDS DE PAIEMENT CLIENTS",
                   font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
         ttk.Label(parent, text=(
             "Enregistrez ici chaque facture émise à un client. L'échéance de paiement est calculée "
