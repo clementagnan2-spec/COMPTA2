@@ -7259,6 +7259,8 @@ class FacturationTab(ttk.Frame):
         self.tree_factures["displaycolumns"] = ("numero", "client", "date", "statut", "total_ttc")
         self.tree_factures.pack(fill="x", padx=12, pady=(2, 8))
         self.tree_factures.bind("<<TreeviewSelect>>", self._on_facture_selected)
+
+        info = ttk.Frame(self)
         info.pack(fill="x", padx=12, pady=4)
         ttk.Label(info, text="N° Facture :").grid(row=0, column=0, sticky="w", padx=4)
         self.numero_var = tk.StringVar()
